@@ -1,0 +1,34 @@
+unresolved symbol(s): [
+    (
+        "foo",
+        Export {
+            name: "bar",
+            ty: Function(
+                FunctionType {
+                    parameters: [
+                        I32,
+                    ],
+                    results: [
+                        I32,
+                    ],
+                },
+            ),
+        },
+    ),
+    (
+        "foo",
+        Export {
+            name: "foo",
+            ty: Function(
+                FunctionType {
+                    parameters: [
+                        I32,
+                    ],
+                    results: [
+                        I32,
+                    ],
+                },
+            ),
+        },
+    ),
+]

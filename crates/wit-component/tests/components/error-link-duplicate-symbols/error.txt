@@ -1,0 +1,42 @@
+duplicate symbol(s): [
+    (
+        "bar",
+        Export {
+            name: "foo",
+            ty: Function(
+                FunctionType {
+                    parameters: [
+                        I32,
+                    ],
+                    results: [
+                        I32,
+                    ],
+                },
+            ),
+        },
+        [
+            "bar",
+            "foo",
+        ],
+    ),
+    (
+        "foo",
+        Export {
+            name: "foo",
+            ty: Function(
+                FunctionType {
+                    parameters: [
+                        I32,
+                    ],
+                    results: [
+                        I32,
+                    ],
+                },
+            ),
+        },
+        [
+            "bar",
+            "foo",
+        ],
+    ),
+]

@@ -25,6 +25,9 @@ use wit_parser::{PackageId, Resolve, UnresolvedPackage};
 ///   `$name`, can be specified for multiple `$name`s
 /// * [optional] `adapt-$name.wit` - required for each `*.wat` adapter to
 ///   describe imports/exports of the adapter.
+/// * [optional] `stub-missing-functions` - if linking libraries and this file
+///   exists, `Linker::stub_missing_functions` will be set to `true`.  The
+///   contents of the file are ignored.
 ///
 /// And the output files are one of the following:
 ///
@@ -78,13 +81,16 @@ fn component_encoding_via_flags() -> Result<()> {
                         .map(|path| ("dlopen-lib-", path, true)),
                 );
 
-            let linker = libs.try_fold(
-                Linker::default().validate(true),
-                |linker, (prefix, path, dl_openable)| {
-                    let (name, wasm) = read_name_and_module(prefix, &path?, &resolve, pkg)?;
-                    Ok::<_, Error>(linker.library(&name, &wasm, dl_openable)?)
-                },
-            )?;
+            let mut linker = Linker::default().validate(true);
+
+            if path.join("stub-missing-functions").is_file() {
+                linker = linker.stub_missing_functions(true);
+            }
+
+            let linker = libs.try_fold(linker, |linker, (prefix, path, dl_openable)| {
+                let (name, wasm) = read_name_and_module(prefix, &path?, &resolve, pkg)?;
+                Ok::<_, Error>(linker.library(&name, &wasm, dl_openable)?)
+            })?;
 
             adapters
                 .try_fold(linker, |linker, path| {
