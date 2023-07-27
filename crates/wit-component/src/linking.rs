@@ -28,14 +28,14 @@ use {
     indexmap::IndexSet,
     metadata::{Export, FunctionType, GlobalType, Metadata, Type, ValueType},
     std::{
-        collections::{hash_map::Entry, HashMap, HashSet},
+        collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet},
         iter,
     },
     wasm_encoder::{
         CodeSection, ConstExpr, DataSection, ElementSection, Elements, EntityType, ExportKind,
         ExportSection, Function, FunctionSection, GlobalSection, HeapType, ImportSection,
-        Instruction as Ins, MemArg, MemorySection, MemoryType, Module, RefType, StartSection,
-        TableSection, TableType, TypeSection, ValType,
+        Instruction as Ins, MemArg, MemorySection, MemoryType, Module, RawCustomSection, RefType,
+        StartSection, TableSection, TableType, TypeSection, ValType,
     },
 };
 
@@ -389,6 +389,9 @@ fn make_env_module<'a>(
     module.section(&globals);
     module.section(&exports);
     module.section(&code);
+    module.section(&RawCustomSection(
+        &crate::base_producers().raw_custom_section(),
+    ));
 
     let module = module.finish();
     wasmparser::validate(&module).unwrap();
@@ -650,6 +653,10 @@ fn make_init_module(
         dl_openables.buffer,
     );
     module.section(&data);
+
+    module.section(&RawCustomSection(
+        &crate::base_producers().raw_custom_section(),
+    ));
 
     let module = module.finish();
     wasmparser::validate(&module)?;
@@ -986,6 +993,9 @@ fn make_stubs_module(missing: &[(&str, Export)]) -> Vec<u8> {
     module.section(&functions);
     module.section(&exports);
     module.section(&code);
+    module.section(&RawCustomSection(
+        &crate::base_producers().raw_custom_section(),
+    ));
 
     let module = module.finish();
     wasmparser::validate(&module).unwrap();
@@ -1241,20 +1251,27 @@ impl Linker {
                         name: format!("{name}:table_base"),
                     },
                 ])
-                .chain(metadata.env_imports.iter().map(|(name, ty)| {
-                    let exporter = find_function_exporter(name, ty, &exporters).unwrap();
+                .chain(
+                    metadata
+                        .env_imports
+                        .iter()
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .map(|(name, ty)| {
+                            let exporter = find_function_exporter(name, ty, &exporters).unwrap();
 
-                    Item {
-                        alias: (*name).into(),
-                        kind: ExportKind::Func,
-                        which: if seen.contains(exporter) {
-                            MainOrAdapter::Adapter(exporter.to_owned())
-                        } else {
-                            MainOrAdapter::Main
-                        },
-                        name: (*name).into(),
-                    }
-                }))
+                            Item {
+                                alias: (*name).into(),
+                                kind: ExportKind::Func,
+                                which: if seen.contains(exporter) {
+                                    MainOrAdapter::Adapter(exporter.to_owned())
+                                } else {
+                                    MainOrAdapter::Main
+                                },
+                                name: (*name).into(),
+                            }
+                        }),
+                )
                 .collect();
 
             let global_item = |address_name: &str| Item {
@@ -1267,6 +1284,8 @@ impl Linker {
             let mem_items = metadata
                 .memory_address_imports
                 .iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
                 .copied()
                 .map(global_item)
                 .chain(["__heap_base", "__heap_end"].into_iter().map(|name| Item {
@@ -1280,11 +1299,13 @@ impl Linker {
             let func_items = metadata
                 .table_address_imports
                 .iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
                 .copied()
                 .map(global_item)
                 .collect();
 
-            let mut import_items = HashMap::<_, Vec<_>>::new();
+            let mut import_items = BTreeMap::<_, Vec<_>>::new();
             for import in &metadata.imports {
                 import_items.entry(import.module).or_default().push(Item {
                     alias: import.name.into(),

@@ -16,7 +16,7 @@ pub const WASM_DYLINK_EXPORT_INFO: u8 = 3;
 pub const WASM_DYLINK_IMPORT_INFO: u8 = 4;
 
 /// Represents a core Wasm value type (not including V128 or reference types, which are not yet supported)
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ValueType {
     I32,
     I64,
@@ -50,7 +50,7 @@ impl From<ValueType> for wasm_encoder::ValType {
 }
 
 /// Represents a core Wasm function type
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FunctionType {
     pub parameters: Vec<ValueType>,
     pub results: Vec<ValueType>,
