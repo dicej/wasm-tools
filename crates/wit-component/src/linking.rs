@@ -28,7 +28,7 @@ use {
     indexmap::IndexSet,
     metadata::{Export, FunctionType, GlobalType, Metadata, Type, ValueType},
     std::{
-        collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet},
+        collections::{hash_map::Entry, BTreeMap, HashMap, HashSet},
         iter,
     },
     wasm_encoder::{
@@ -1249,27 +1249,20 @@ impl Linker {
                         name: format!("{name}:table_base"),
                     },
                 ])
-                .chain(
-                    metadata
-                        .env_imports
-                        .iter()
-                        .collect::<BTreeSet<_>>()
-                        .into_iter()
-                        .map(|(name, ty)| {
-                            let exporter = find_function_exporter(name, ty, &exporters).unwrap();
+                .chain(metadata.env_imports.iter().map(|(name, ty)| {
+                    let exporter = find_function_exporter(name, ty, &exporters).unwrap();
 
-                            Item {
-                                alias: (*name).into(),
-                                kind: ExportKind::Func,
-                                which: if seen.contains(exporter) {
-                                    MainOrAdapter::Adapter(exporter.to_owned())
-                                } else {
-                                    MainOrAdapter::Main
-                                },
-                                name: (*name).into(),
-                            }
-                        }),
-                )
+                    Item {
+                        alias: (*name).into(),
+                        kind: ExportKind::Func,
+                        which: if seen.contains(exporter) {
+                            MainOrAdapter::Adapter(exporter.to_owned())
+                        } else {
+                            MainOrAdapter::Main
+                        },
+                        name: (*name).into(),
+                    }
+                }))
                 .collect();
 
             let global_item = |address_name: &str| Item {
@@ -1282,8 +1275,6 @@ impl Linker {
             let mem_items = metadata
                 .memory_address_imports
                 .iter()
-                .collect::<BTreeSet<_>>()
-                .into_iter()
                 .copied()
                 .map(global_item)
                 .chain(["__heap_base", "__heap_end"].into_iter().map(|name| Item {
@@ -1297,8 +1288,6 @@ impl Linker {
             let func_items = metadata
                 .table_address_imports
                 .iter()
-                .collect::<BTreeSet<_>>()
-                .into_iter()
                 .copied()
                 .map(global_item)
                 .collect();

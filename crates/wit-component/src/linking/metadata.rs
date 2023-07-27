@@ -3,7 +3,7 @@
 
 use {
     anyhow::{bail, Context, Error, Result},
-    std::collections::HashSet,
+    std::collections::{BTreeSet, HashSet},
     wasmparser::{
         BinaryReader, BinaryReaderError, ExternalKind, FuncType, Parser, Payload, RefType,
         StructuralType, Subsection, Subsections, TableType, TypeRef, ValType,
@@ -76,14 +76,14 @@ impl TryFrom<&FuncType> for FunctionType {
 }
 
 /// Represents a core Wasm global variable type
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct GlobalType {
     pub ty: ValueType,
     pub mutable: bool,
 }
 
 /// Represents a core Wasm export or import type
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Type {
     Function(FunctionType),
     Global(GlobalType),
@@ -99,7 +99,7 @@ impl From<&Type> for wasm_encoder::ExportKind {
 }
 
 /// Represents a core Wasm import
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Import<'a> {
     pub module: &'a str,
     pub name: &'a str,
@@ -107,7 +107,7 @@ pub struct Import<'a> {
 }
 
 /// Represents a core Wasm export
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Export<'a> {
     pub name: &'a str,
     pub ty: Type,
@@ -165,19 +165,19 @@ pub struct Metadata<'a> {
     pub has_component_exports: bool,
 
     /// The functions imported from the `env` module, if any
-    pub env_imports: HashSet<(&'a str, FunctionType)>,
+    pub env_imports: BTreeSet<(&'a str, FunctionType)>,
 
     /// The memory addresses imported from `GOT.mem`, if any
-    pub memory_address_imports: HashSet<&'a str>,
+    pub memory_address_imports: BTreeSet<&'a str>,
 
     /// The table addresses imported from `GOT.func`, if any
-    pub table_address_imports: HashSet<&'a str>,
+    pub table_address_imports: BTreeSet<&'a str>,
 
     /// The symbols exported by this module, if any
-    pub exports: HashSet<Export<'a>>,
+    pub exports: BTreeSet<Export<'a>>,
 
     /// The symbols imported by this module (and not accounted for in the above fields), if any
-    pub imports: HashSet<Import<'a>>,
+    pub imports: BTreeSet<Import<'a>>,
 }
 
 #[allow(dead_code)]
@@ -266,11 +266,11 @@ impl<'a> Metadata<'a> {
             has_ctors: false,
             has_set_libraries: false,
             has_component_exports,
-            env_imports: HashSet::new(),
-            memory_address_imports: HashSet::new(),
-            table_address_imports: HashSet::new(),
-            exports: HashSet::new(),
-            imports: HashSet::new(),
+            env_imports: BTreeSet::new(),
+            memory_address_imports: BTreeSet::new(),
+            table_address_imports: BTreeSet::new(),
+            exports: BTreeSet::new(),
+            imports: BTreeSet::new(),
         };
         let mut types = Vec::new();
         let mut function_types = Vec::new();
