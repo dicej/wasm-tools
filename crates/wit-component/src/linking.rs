@@ -1185,7 +1185,6 @@ impl Linker {
                 .collect::<HashSet<_>>();
 
             if !unreachable.is_empty() {
-                println!("note: pruning unreachable libraries: {unreachable:?}");
                 self.libraries
                     .retain(|(name, ..)| !unreachable.contains(name));
                 return self.encode();
@@ -1240,7 +1239,6 @@ impl Linker {
                     Item {
                         alias: "__memory_base".into(),
                         kind: ExportKind::Global,
-
                         which: MainOrAdapter::Main,
                         name: format!("{name}:memory_base"),
                     },

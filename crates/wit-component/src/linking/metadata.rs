@@ -113,7 +113,7 @@ pub struct Export<'a> {
     pub ty: Type,
 }
 
-/// Represents a `WASM_DYLINK_MEM_INFO` field
+/// Represents a `WASM_DYLINK_MEM_INFO` value
 #[derive(Debug, Copy, Clone)]
 pub struct MemInfo {
     pub memory_size: u32,
@@ -143,10 +143,10 @@ pub struct Metadata<'a> {
     /// along with everything else.
     pub name: &'a str,
 
-    /// Whether this module should be resolveable via `dlopen`
+    /// Whether this module should be resolvable via `dlopen`
     pub dl_openable: bool,
 
-    /// The `WASM_DYLINK_MEM_INFO` field (or all zeros if not found)
+    /// The `WASM_DYLINK_MEM_INFO` value (or all zeros if not found)
     pub mem_info: MemInfo,
 
     /// The `WASM_DYLINK_NEEDED` values, if any
@@ -254,12 +254,8 @@ impl<'a> Metadata<'a> {
         module: &'a [u8],
         adapter_names: &HashSet<&str>,
     ) -> Result<Self> {
-        let has_component_exports = crate::metadata::decode(module)?
-            .1
-            .resolve
-            .worlds
-            .iter()
-            .any(|(_, world)| !world.exports.is_empty());
+        let bindgen = crate::metadata::decode(module)?.1;
+        let has_component_exports = !bindgen.resolve.worlds[bindgen.world].exports.is_empty();
 
         let mut result = Self {
             name,
