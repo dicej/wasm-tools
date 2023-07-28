@@ -26,7 +26,7 @@ use {
     crate::encoding::{ComponentEncoder, Instance, Item, LibraryInfo, MainOrAdapter},
     anyhow::{anyhow, bail, Context, Result},
     indexmap::IndexSet,
-    metadata::{Export, FunctionType, GlobalType, Metadata, Type, ValueType},
+    metadata::{Export, ExportKey, FunctionType, GlobalType, Metadata, Type, ValueType},
     std::{
         collections::{hash_map::Entry, BTreeMap, HashMap, HashSet},
         iter,
@@ -37,6 +37,7 @@ use {
         Instruction as Ins, MemArg, MemorySection, MemoryType, Module, RawCustomSection, RefType,
         StartSection, TableSection, TableType, TypeSection, ValType,
     },
+    wasmparser::WASM_SYM_BINDING_WEAK,
 };
 
 mod metadata;
@@ -101,17 +102,17 @@ impl<'a> DlOpenables<'a> {
                         .iter()
                         .map(|export| {
                             let name_address = memory_base + u32::try_from(buffer.len()).unwrap();
-                            write_bytes_padded(&mut buffer, export.name.as_bytes());
+                            write_bytes_padded(&mut buffer, export.key.name.as_bytes());
 
-                            let address = if let Type::Function(_) = &export.ty {
+                            let address = if let Type::Function(_) = &export.key.ty {
                                 Address::Function(
                                     table_base + get_and_increment(&mut function_count),
                                 )
                             } else {
-                                Address::Global(export.name)
+                                Address::Global(export.key.name)
                             };
 
-                            (export.name, name_address, address)
+                            (export.key.name, name_address, address)
                         })
                         .collect::<Vec<_>>();
 
@@ -405,7 +406,7 @@ fn make_env_module<'a>(
 /// This module also contains the data segment for the `dlopen`/`dlsym` lookup table.
 fn make_init_module(
     metadata: &[Metadata],
-    exporters: &HashMap<&Export, &str>,
+    exporters: &HashMap<&ExportKey, (&str, &Export)>,
     function_exports: &[(&str, &FunctionType, usize)],
     dl_openables: DlOpenables,
     indirection_table_base: u32,
@@ -421,7 +422,7 @@ fn make_init_module(
     for metadata in metadata {
         if metadata.dl_openable {
             for export in &metadata.exports {
-                if let Type::Function(ty) = &export.ty {
+                if let Type::Function(ty) = &export.key.ty {
                     types.function(
                         ty.parameters.iter().copied().map(ValType::from),
                         ty.results.iter().copied().map(ValType::from),
@@ -552,7 +553,7 @@ fn make_init_module(
         }
 
         for import in &metadata.memory_address_imports {
-            let exporter = find_offset_exporter(import, exporters)?;
+            let (exporter, _) = find_offset_exporter(import, exporters)?;
 
             memory_address_inits.push(Ins::GlobalGet(add_global_import(
                 &mut imports,
@@ -580,11 +581,11 @@ fn make_init_module(
     for metadata in metadata {
         if metadata.dl_openable {
             for export in &metadata.exports {
-                if let Type::Function(_) = &export.ty {
+                if let Type::Function(_) = &export.key.ty {
                     dl_openable_functions.push(add_function_import(
                         &mut imports,
                         metadata.name,
-                        export.name,
+                        export.key.name,
                         get_and_increment(&mut type_offset),
                     ));
                 }
@@ -665,8 +666,11 @@ fn make_init_module(
 }
 
 /// Find the library which exports the specified function or global address.
-fn find_offset_exporter<'a>(name: &str, exporters: &HashMap<&Export, &'a str>) -> Result<&'a str> {
-    let export = Export {
+fn find_offset_exporter<'a>(
+    name: &str,
+    exporters: &HashMap<&ExportKey, (&'a str, &'a Export<'a>)>,
+) -> Result<(&'a str, &'a Export<'a>)> {
+    let export = ExportKey {
         name,
         ty: Type::Global(GlobalType {
             ty: ValueType::I32,
@@ -684,9 +688,9 @@ fn find_offset_exporter<'a>(name: &str, exporters: &HashMap<&Export, &'a str>) -
 fn find_function_exporter<'a>(
     name: &str,
     ty: &FunctionType,
-    exporters: &HashMap<&Export, &'a str>,
-) -> Result<&'a str> {
-    let export = Export {
+    exporters: &HashMap<&ExportKey, (&'a str, &'a Export<'a>)>,
+) -> Result<(&'a str, &'a Export<'a>)> {
+    let export = ExportKey {
         name,
         ty: Type::Function(ty.clone()),
     };
@@ -700,11 +704,14 @@ fn find_function_exporter<'a>(
 /// Analyze the specified library metadata, producing a symbol-to-library-name map of exports.
 fn resolve_exporters<'a>(
     metadata: &'a [Metadata<'a>],
-) -> Result<HashMap<&'a Export<'a>, Vec<&'a str>>> {
+) -> Result<HashMap<&'a ExportKey<'a>, Vec<(&'a str, &'a Export<'a>)>>> {
     let mut exporters = HashMap::<_, Vec<_>>::new();
     for metadata in metadata {
         for export in &metadata.exports {
-            exporters.entry(export).or_default().push(metadata.name);
+            exporters
+                .entry(&export.key)
+                .or_default()
+                .push((metadata.name, export));
         }
     }
     Ok(exporters)
@@ -713,11 +720,11 @@ fn resolve_exporters<'a>(
 /// Match up all imported symbols to their corresponding exports, reporting any missing or duplicate symbols.
 fn resolve_symbols<'a>(
     metadata: &'a [Metadata<'a>],
-    exporters: &'a HashMap<&'a Export<'a>, Vec<&'a str>>,
+    exporters: &'a HashMap<&'a ExportKey<'a>, Vec<(&'a str, &'a Export<'a>)>>,
 ) -> (
-    HashMap<&'a Export<'a>, &'a str>,
+    HashMap<&'a ExportKey<'a>, (&'a str, &'a Export<'a>)>,
     Vec<(&'a str, Export<'a>)>,
-    Vec<(&'a str, &'a Export<'a>, &'a [&'a str])>,
+    Vec<(&'a str, &'a ExportKey<'a>, &'a [(&'a str, &'a Export<'a>)])>,
 ) {
     // TODO: consider weak symbols when checking for duplicates
 
@@ -736,8 +743,8 @@ fn resolve_symbols<'a>(
     let mut missing = Vec::new();
     let mut duplicates = Vec::new();
 
-    let mut triage = |metadata: &'a Metadata, export| {
-        if let Some((key, value)) = exporters.get_key_value(&export) {
+    let mut triage = |metadata: &'a Metadata, export: Export<'a>| {
+        if let Some((key, value)) = exporters.get_key_value(&export.key) {
             match value.as_slice() {
                 [] => unreachable!(),
                 [exporter] => {
@@ -753,12 +760,15 @@ fn resolve_symbols<'a>(
     };
 
     for metadata in metadata {
-        for (name, ty) in &metadata.env_imports {
+        for (name, (ty, flags)) in &metadata.env_imports {
             triage(
                 metadata,
                 Export {
-                    name,
-                    ty: Type::Function(ty.clone()),
+                    key: ExportKey {
+                        name,
+                        ty: Type::Function(ty.clone()),
+                    },
+                    flags: *flags,
                 },
             );
         }
@@ -767,11 +777,14 @@ fn resolve_symbols<'a>(
             triage(
                 metadata,
                 Export {
-                    name,
-                    ty: Type::Global(GlobalType {
-                        ty: ValueType::I32,
-                        mutable: false,
-                    }),
+                    key: ExportKey {
+                        name,
+                        ty: Type::Global(GlobalType {
+                            ty: ValueType::I32,
+                            mutable: false,
+                        }),
+                    },
+                    flags: 0,
                 },
             );
         }
@@ -793,11 +806,14 @@ fn resolve_symbols<'a>(
                 missing.push((
                     metadata.name,
                     Export {
-                        name,
-                        ty: Type::Function(FunctionType {
-                            parameters: Vec::new(),
-                            results: Vec::new(),
-                        }),
+                        key: ExportKey {
+                            name,
+                            ty: Type::Function(FunctionType {
+                                parameters: Vec::new(),
+                                results: Vec::new(),
+                            }),
+                        },
+                        flags: 0,
                     },
                 ));
             }
@@ -850,7 +866,7 @@ fn topo_sort(count: usize, dependencies: &HashMap<usize, HashSet<usize>>) -> Res
 /// represented by its offset in the original metadata slice.
 fn find_dependencies(
     metadata: &[Metadata],
-    exporters: &HashMap<&Export, &str>,
+    exporters: &HashMap<&ExportKey, (&str, &Export)>,
 ) -> Result<HashMap<usize, HashSet<usize>>> {
     let mut dependencies = HashMap::<_, HashSet<_>>::new();
     let mut indexes = HashMap::new();
@@ -862,11 +878,11 @@ fn find_dependencies(
                 .or_default()
                 .insert(needed);
         }
-        for (import_name, ty) in &metadata.env_imports {
+        for (import_name, (ty, _)) in &metadata.env_imports {
             dependencies
                 .entry(metadata.name)
                 .or_default()
-                .insert(find_function_exporter(import_name, ty, exporters)?);
+                .insert(find_function_exporter(import_name, ty, exporters)?.0);
         }
     }
 
@@ -909,7 +925,7 @@ fn find_dependencies(
 /// the original export.
 fn env_function_exports<'a>(
     metadata: &'a [Metadata<'a>],
-    exporters: &'a HashMap<&'a Export, &'a str>,
+    exporters: &'a HashMap<&'a ExportKey, (&'a str, &Export)>,
     topo_sorted: &[usize],
 ) -> Result<Vec<(&'a str, &'a FunctionType, usize)>> {
     let function_exporters = exporters
@@ -938,7 +954,7 @@ fn env_function_exports<'a>(
 
         for name in &metadata.table_address_imports {
             if !exported.contains(name) {
-                let (ty, exporter) = function_exporters
+                let (ty, (exporter, _)) = function_exporters
                     .get(name)
                     .ok_or_else(|| anyhow!("unable to find {name:?} in any library"))?;
 
@@ -947,9 +963,11 @@ fn env_function_exports<'a>(
             }
         }
 
-        for (import_name, ty) in &metadata.env_imports {
+        for (import_name, (ty, _)) in &metadata.env_imports {
             if !exported.contains(import_name) {
-                let exporter = indexes[find_function_exporter(import_name, ty, exporters).unwrap()];
+                let exporter = indexes[find_function_exporter(import_name, ty, exporters)
+                    .unwrap()
+                    .0];
                 if !seen.contains(&exporter) {
                     result.push((*import_name, ty, exporter));
                     exported.insert(*import_name);
@@ -971,7 +989,7 @@ fn make_stubs_module(missing: &[(&str, Export)]) -> Vec<u8> {
     for (offset, (_, export)) in missing.iter().enumerate() {
         let offset = u32::try_from(offset).unwrap();
 
-        let Export { name, ty: Type::Function(ty) } = export else {
+        let Export { key: ExportKey { name, ty: Type::Function(ty) }, .. } = export else {
             unreachable!();
         };
 
@@ -1136,7 +1154,7 @@ impl Linker {
         let mut exporters = resolve_exporters(&metadata)?;
 
         let cabi_realloc_exporter = exporters
-            .get_mut(&Export {
+            .get_mut(&ExportKey {
                 name: "cabi_realloc",
                 ty: Type::Function(FunctionType {
                     parameters: vec![ValueType::I32; 4],
@@ -1147,16 +1165,19 @@ impl Linker {
                 // TODO: Verify that there is at most one strong exporter
                 let first = *exporters.first().unwrap();
                 *exporters = vec![first];
-                first
+                first.0
             });
 
         let (exporters, missing, duplicates) = resolve_symbols(&metadata, &exporters);
 
         if !missing.is_empty() {
-            if self.stub_missing_functions
-                && missing
-                    .iter()
-                    .all(|(_, export)| matches!(&export.ty, Type::Function(_)))
+            if missing
+                .iter()
+                .all(|(_, export)| matches!(&export.key.ty, Type::Function(_)))
+                && (self.stub_missing_functions
+                    || missing
+                        .iter()
+                        .all(|(_, export)| 0 != (export.flags & WASM_SYM_BINDING_WEAK)))
             {
                 self.stub_missing_functions = false;
                 self.libraries.push((
@@ -1166,11 +1187,18 @@ impl Linker {
                 ));
                 return self.encode();
             } else {
-                bail!("unresolved symbol(s): {missing:#?}")
+                bail!(
+                    "unresolved symbol(s): {:#?}",
+                    missing
+                        .iter()
+                        .filter(|(_, export)| 0 == (export.flags & WASM_SYM_BINDING_WEAK))
+                        .collect::<Vec<_>>()
+                );
             }
         }
 
         if !duplicates.is_empty() {
+            // TODO: Check for weak symbols before giving up here
             bail!("duplicate symbol(s): {duplicates:#?}");
         }
 
@@ -1249,8 +1277,8 @@ impl Linker {
                         name: format!("{name}:table_base"),
                     },
                 ])
-                .chain(metadata.env_imports.iter().map(|(name, ty)| {
-                    let exporter = find_function_exporter(name, ty, &exporters).unwrap();
+                .chain(metadata.env_imports.iter().map(|(name, (ty, _))| {
+                    let (exporter, _) = find_function_exporter(name, ty, &exporters).unwrap();
 
                     Item {
                         alias: (*name).into(),

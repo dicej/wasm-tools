@@ -1,7 +1,7 @@
 duplicate symbol(s): [
     (
         "bar",
-        Export {
+        ExportKey {
             name: "foo",
             ty: Function(
                 FunctionType {
@@ -15,13 +15,49 @@ duplicate symbol(s): [
             ),
         },
         [
-            "bar",
-            "foo",
+            (
+                "bar",
+                Export {
+                    key: ExportKey {
+                        name: "foo",
+                        ty: Function(
+                            FunctionType {
+                                parameters: [
+                                    I32,
+                                ],
+                                results: [
+                                    I32,
+                                ],
+                            },
+                        ),
+                    },
+                    flags: 0,
+                },
+            ),
+            (
+                "foo",
+                Export {
+                    key: ExportKey {
+                        name: "foo",
+                        ty: Function(
+                            FunctionType {
+                                parameters: [
+                                    I32,
+                                ],
+                                results: [
+                                    I32,
+                                ],
+                            },
+                        ),
+                    },
+                    flags: 0,
+                },
+            ),
         ],
     ),
     (
         "foo",
-        Export {
+        ExportKey {
             name: "foo",
             ty: Function(
                 FunctionType {
@@ -35,8 +71,44 @@ duplicate symbol(s): [
             ),
         },
         [
-            "bar",
-            "foo",
+            (
+                "bar",
+                Export {
+                    key: ExportKey {
+                        name: "foo",
+                        ty: Function(
+                            FunctionType {
+                                parameters: [
+                                    I32,
+                                ],
+                                results: [
+                                    I32,
+                                ],
+                            },
+                        ),
+                    },
+                    flags: 0,
+                },
+            ),
+            (
+                "foo",
+                Export {
+                    key: ExportKey {
+                        name: "foo",
+                        ty: Function(
+                            FunctionType {
+                                parameters: [
+                                    I32,
+                                ],
+                                results: [
+                                    I32,
+                                ],
+                            },
+                        ),
+                    },
+                    flags: 0,
+                },
+            ),
         ],
     ),
 ]

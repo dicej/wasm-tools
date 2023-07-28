@@ -3,7 +3,7 @@
 
 use {
     anyhow::{bail, Context, Error, Result},
-    std::collections::{BTreeSet, HashSet},
+    std::collections::{BTreeSet, HashMap, HashSet},
     wasmparser::{
         BinaryReader, BinaryReaderError, ExternalKind, FuncType, Parser, Payload, RefType,
         StructuralType, Subsection, Subsections, TableType, TypeRef, ValType,
@@ -104,13 +104,21 @@ pub struct Import<'a> {
     pub module: &'a str,
     pub name: &'a str,
     pub ty: Type,
+    pub flags: u32,
 }
 
 /// Represents a core Wasm export
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Export<'a> {
+pub struct ExportKey<'a> {
     pub name: &'a str,
     pub ty: Type,
+}
+
+/// Represents a core Wasm export, including dylink.0 flags
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Export<'a> {
+    pub key: ExportKey<'a>,
+    pub flags: u32,
 }
 
 /// Represents a `WASM_DYLINK_MEM_INFO` value
@@ -165,7 +173,7 @@ pub struct Metadata<'a> {
     pub has_component_exports: bool,
 
     /// The functions imported from the `env` module, if any
-    pub env_imports: BTreeSet<(&'a str, FunctionType)>,
+    pub env_imports: BTreeSet<(&'a str, (FunctionType, u32))>,
 
     /// The memory addresses imported from `GOT.mem`, if any
     pub memory_address_imports: BTreeSet<&'a str>,
@@ -180,14 +188,12 @@ pub struct Metadata<'a> {
     pub imports: BTreeSet<Import<'a>>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 struct ExportInfo<'a> {
     name: &'a str,
     flags: u32,
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 struct ImportInfo<'a> {
     module: &'a str,
@@ -275,6 +281,8 @@ impl<'a> Metadata<'a> {
         let mut types = Vec::new();
         let mut function_types = Vec::new();
         let mut global_types = Vec::new();
+        let mut import_info = HashMap::new();
+        let mut export_info = HashMap::new();
 
         for payload in Parser::new(0).parse_all(module) {
             match payload? {
@@ -284,8 +292,14 @@ impl<'a> Metadata<'a> {
                         match subsection.context("failed to parse `dylink.0` subsection")? {
                             DylinkSubsection::MemInfo(info) => result.mem_info = info,
                             DylinkSubsection::Needed(needed) => result.needed_libs = needed.clone(),
-                            DylinkSubsection::ExportInfo(_) | DylinkSubsection::ImportInfo(_) => {
-                                // TODO: Use flags to help direct symbol resolution
+                            DylinkSubsection::ExportInfo(info) => {
+                                export_info.extend(info.iter().map(|info| (info.name, info.flags)));
+                            }
+                            DylinkSubsection::ImportInfo(info) => {
+                                import_info.extend(
+                                    info.iter()
+                                        .map(|info| ((info.module, info.field), info.flags)),
+                                );
                             }
                             DylinkSubsection::Unknown(index) => {
                                 bail!("unrecognized `dylink.0` subsection: {index}")
@@ -361,9 +375,12 @@ impl<'a> Metadata<'a> {
                                 if let TypeRef::Func(ty) = import.ty {
                                     result.env_imports.insert((
                                         name,
-                                        FunctionType::try_from(
-                                            &types[usize::try_from(ty).unwrap()],
-                                        )?,
+                                        (
+                                            FunctionType::try_from(
+                                                &types[usize::try_from(ty).unwrap()],
+                                            )?,
+                                            *import_info.get(&("env", name)).unwrap_or(&0),
+                                        ),
                                     ));
                                 } else {
                                     return type_error();
@@ -397,25 +414,28 @@ impl<'a> Metadata<'a> {
                                 }
                             }
                             (module, name) if adapter_names.contains(module) => {
+                                let ty = match import.ty {
+                                    TypeRef::Global(wasmparser::GlobalType {
+                                        content_type,
+                                        mutable,
+                                    }) => Type::Global(GlobalType {
+                                        ty: content_type.try_into()?,
+                                        mutable,
+                                    }),
+                                    TypeRef::Func(ty) => Type::Function(FunctionType::try_from(
+                                        &types[usize::try_from(ty).unwrap()],
+                                    )?),
+                                    ty => {
+                                        bail!("unsupported import kind for {module}.{name}: {ty:?}",)
+                                    }
+                                };
+                                let flags = *import_info.get(&(module, name)).unwrap_or(&0);
                                 result.imports.insert(Import {
-                                        module,
-                                        name,
-                                        ty: match import.ty {
-                                            TypeRef::Global(wasmparser::GlobalType {
-                                                content_type, mutable
-                                            }) => {
-                                                Type::Global(GlobalType { ty: content_type.try_into()?, mutable })
-                                            }
-                                            TypeRef::Func(ty) => Type::Function(FunctionType::try_from(
-                                                &types[usize::try_from(ty).unwrap()],
-                                            )?),
-                                            ty => {
-                                                bail!(
-                                                    "unsupported import kind for {module}.{name}: {ty:?}",
-                                                )
-                                            }
-                                        }
-                                    });
+                                    module,
+                                    name,
+                                    ty,
+                                    flags,
+                                });
                             }
                             _ => {
                                 if !matches!(import.ty, TypeRef::Func(_) | TypeRef::Global(_)) {
@@ -447,30 +467,33 @@ impl<'a> Metadata<'a> {
                             "__wasm_call_ctors" => result.has_ctors = true,
                             "__wasm_set_libraries" => result.has_set_libraries = true,
                             _ => {
+                                let ty = match export.kind {
+                                    ExternalKind::Func => Type::Function(FunctionType::try_from(
+                                        &types[function_types
+                                            [usize::try_from(export.index).unwrap()]],
+                                    )?),
+                                    ExternalKind::Global => {
+                                        let ty =
+                                            global_types[usize::try_from(export.index).unwrap()];
+                                        Type::Global(GlobalType {
+                                            ty: ValueType::try_from(ty.content_type)?,
+                                            mutable: ty.mutable,
+                                        })
+                                    }
+                                    kind => {
+                                        bail!(
+                                            "unsupported export kind for {}: {kind:?}",
+                                            export.name
+                                        )
+                                    }
+                                };
+                                let flags = *export_info.get(&export.name).unwrap_or(&0);
                                 result.exports.insert(Export {
-                                    name: export.name,
-                                    ty: match export.kind {
-                                        ExternalKind::Func => {
-                                            Type::Function(FunctionType::try_from(
-                                                &types[function_types
-                                                    [usize::try_from(export.index).unwrap()]],
-                                            )?)
-                                        }
-                                        ExternalKind::Global => {
-                                            let ty = global_types
-                                                [usize::try_from(export.index).unwrap()];
-                                            Type::Global(GlobalType {
-                                                ty: ValueType::try_from(ty.content_type)?,
-                                                mutable: ty.mutable,
-                                            })
-                                        }
-                                        kind => {
-                                            bail!(
-                                                "unsupported export kind for {}: {kind:?}",
-                                                export.name
-                                            )
-                                        }
+                                    key: ExportKey {
+                                        name: export.name,
+                                        ty,
                                     },
+                                    flags,
                                 });
                             }
                         }
