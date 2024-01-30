@@ -5,7 +5,8 @@ use anyhow::{anyhow, bail, Result};
 use indexmap::{IndexMap, IndexSet};
 use petgraph::EdgeDirection;
 use smallvec::SmallVec;
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
+use std::fmt;
 use std::mem;
 use wasm_encoder::*;
 use wasmparser::{
@@ -599,6 +600,17 @@ impl<'a> TypeEncoder<'a> {
                 return ret;
             }
 
+            if let Some((instance, name)) = state.cur.instance_exports.get(&key) {
+                let ret = state.cur.encodable.type_count();
+                state.cur.encodable.alias(Alias::InstanceExport {
+                    instance: *instance,
+                    name,
+                    kind: ComponentExportKind::Type,
+                });
+                log::trace!("id defined in current instance");
+                return ret;
+            }
+
             match id.peel_alias(&self.0.types) {
                 Some(next) => id = next,
                 // If there's no more aliases then fall through to the
@@ -611,15 +623,17 @@ impl<'a> TypeEncoder<'a> {
         return match id {
             AnyTypeId::Core(ComponentCoreTypeId::Sub(_)) => unreachable!(),
             AnyTypeId::Core(ComponentCoreTypeId::Module(id)) => self.module_type(state, id),
-            AnyTypeId::Component(id) => match id {
-                ComponentAnyTypeId::Resource(_) => {
-                    unreachable!("should have been handled in `TypeEncoder::component_entity_type`")
+            AnyTypeId::Component(id) => {
+                match id {
+                    ComponentAnyTypeId::Resource(r) => {
+                        unreachable!("should have been handled in `TypeEncoder::component_entity_type`: {r:?}")
+                    }
+                    ComponentAnyTypeId::Defined(id) => self.defined_type(state, id),
+                    ComponentAnyTypeId::Func(id) => self.component_func_type(state, id),
+                    ComponentAnyTypeId::Instance(id) => self.component_instance_type(state, id),
+                    ComponentAnyTypeId::Component(id) => self.component_type(state, id),
                 }
-                ComponentAnyTypeId::Defined(id) => self.defined_type(state, id),
-                ComponentAnyTypeId::Func(id) => self.component_func_type(state, id),
-                ComponentAnyTypeId::Instance(id) => self.component_instance_type(state, id),
-                ComponentAnyTypeId::Component(id) => self.component_type(state, id),
-            },
+            }
         };
     }
 
@@ -1313,8 +1327,9 @@ impl<'a> CompositionGraphEncoder<'a> {
         self.encode_components(&mut encoded);
         self.encode_instantiations(&mut encoded)?;
 
-        if let Some(id) = self.options.export {
-            self.encode_exports(&mut encoded, id)?;
+        let mut names = HashSet::new();
+        for id in self.options.exports.clone() {
+            self.encode_exports(&mut encoded, id, &mut names)?;
         }
 
         Ok(encoded.finish())
@@ -1409,7 +1424,7 @@ impl<'a> CompositionGraphEncoder<'a> {
         state.push(Encodable::Instance(InstanceType::new()));
         for (name, types) in exports {
             let (component, ty) = types[0];
-            log::trace!("export {name}");
+            log::trace!("export {name}: {ty:?}");
             let export = TypeEncoder::new(component).export(name, ty, state);
             let t = match &mut state.cur.encodable {
                 Encodable::Instance(c) => c,
@@ -1425,6 +1440,7 @@ impl<'a> CompositionGraphEncoder<'a> {
                 }
             }
         }
+
         let instance_type = match state.pop() {
             Encodable::Instance(c) => c,
             _ => unreachable!(),
@@ -1463,6 +1479,7 @@ impl<'a> CompositionGraphEncoder<'a> {
         &mut self,
         encoded: &mut ComponentBuilder,
         instance_id: InstanceId,
+        names: &mut HashSet<String>,
     ) -> Result<()> {
         let instance = self.graph.instances.get(&instance_id).ok_or_else(|| {
             anyhow!("cannot export specified instance because it does not exist in the graph")
@@ -1472,25 +1489,29 @@ impl<'a> CompositionGraphEncoder<'a> {
         let encoded_instance_index = self.encoded_instances[&instance_id];
 
         for (export_index, export_name, kind, _) in entry.component.exports() {
-            let kind = match kind {
-                ComponentExternalKind::Module => ComponentExportKind::Module,
-                ComponentExternalKind::Func => ComponentExportKind::Func,
-                ComponentExternalKind::Value => ComponentExportKind::Value,
-                ComponentExternalKind::Type => ComponentExportKind::Type,
-                ComponentExternalKind::Instance => ComponentExportKind::Instance,
-                ComponentExternalKind::Component => ComponentExportKind::Component,
-            };
+            if !names.contains(export_name) {
+                names.insert(export_name.to_owned());
 
-            let index = match self.aliases.get(&(instance_id, export_index)) {
-                Some(index) => *index,
-                None => {
-                    let index = self.alias(encoded, encoded_instance_index, export_name, kind);
-                    self.aliases.insert((instance_id, export_index), index);
-                    index
-                }
-            };
+                let kind = match kind {
+                    ComponentExternalKind::Module => ComponentExportKind::Module,
+                    ComponentExternalKind::Func => ComponentExportKind::Func,
+                    ComponentExternalKind::Value => ComponentExportKind::Value,
+                    ComponentExternalKind::Type => ComponentExportKind::Type,
+                    ComponentExternalKind::Instance => ComponentExportKind::Instance,
+                    ComponentExternalKind::Component => ComponentExportKind::Component,
+                };
 
-            encoded.export(export_name, kind, index, None);
+                let index = match self.aliases.get(&(instance_id, export_index)) {
+                    Some(index) => *index,
+                    None => {
+                        let index = self.alias(encoded, encoded_instance_index, export_name, kind);
+                        self.aliases.insert((instance_id, export_index), index);
+                        index
+                    }
+                };
+
+                encoded.export(export_name, kind, index, None);
+            }
         }
 
         Ok(())

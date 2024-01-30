@@ -433,18 +433,18 @@ pub(crate) struct Instance {
 }
 
 /// The options for encoding a composition graph.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+#[derive(Debug, Clone, Eq, PartialEq, Default)]
 pub struct EncodeOptions {
     /// Whether or not to define instantiated components.
     ///
     /// If `false`, components will be imported instead.
     pub define_components: bool,
 
-    /// The instance in the graph to export.
+    /// The instances in the graph to export.
     ///
-    /// If `Some`, the instance's exports will be aliased and
+    /// If non-empty, the instances' exports will be aliased and
     /// exported from the resulting component.
-    pub export: Option<InstanceId>,
+    pub exports: Vec<InstanceId>,
 
     /// Whether or not to validate the encoded output.
     pub validate: bool,
@@ -502,9 +502,6 @@ impl ResourceMapping {
                         if value.1 == export_resource {
                             self.map.insert(export_resource, value);
                             self.map.insert(import_resource, value);
-                        } else {
-                            // Can't set two different exports equal to each other -- give up.
-                            return None;
                         }
                     } else {
                         // Couldn't find an export with a name that matches this
@@ -555,8 +552,8 @@ impl<'a> CompositionGraph<'a> {
     ///
     /// This should be the last step prior to encoding, after all
     /// inter-component connections have been made.  It ensures that each set of
-    /// identical imports composed component can be merged into a single import
-    /// in the output component.
+    /// identical imports in the composed components can be merged into a single
+    /// import in the output component.
     pub(crate) fn unify_imported_resources(&self) {
         let mut resource_mapping = self.resource_mapping.borrow_mut();
 
@@ -589,7 +586,7 @@ impl<'a> CompositionGraph<'a> {
             }
         }
 
-        for resources in resource_imports.values() {
+        for (key, resources) in resource_imports.iter() {
             match &resources[..] {
                 [] => unreachable!(),
                 [_] => {}
@@ -646,10 +643,8 @@ impl<'a> CompositionGraph<'a> {
                 .remap_component_entity(&mut import_type, remapping);
             remapping.reset_type_cache();
 
-            if context
-                .component_entity_type(&export_type, &import_type, 0)
-                .is_ok()
-            {
+            let v = context.component_entity_type(&export_type, &import_type, 0);
+            if v.is_ok() {
                 *self.resource_mapping.borrow_mut() = resource_mapping;
                 true
             } else {
@@ -698,6 +693,10 @@ impl<'a> CompositionGraph<'a> {
         };
 
         assert!(self.components.insert(id, entry).is_none());
+
+        if self.components.len() > 1 {
+            self.unify_imported_resources();
+        }
 
         Ok(id)
     }
@@ -989,9 +988,10 @@ impl<'a> CompositionGraph<'a> {
 
     /// Encodes the current composition graph as a WebAssembly component.
     pub fn encode(&self, options: EncodeOptions) -> Result<Vec<u8>> {
+        let validate = options.validate;
         let bytes = CompositionGraphEncoder::new(options, self).encode()?;
 
-        if options.validate {
+        if validate {
             Validator::new_with_features(WasmFeatures {
                 component_model: true,
                 ..Default::default()

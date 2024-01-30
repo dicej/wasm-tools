@@ -495,8 +495,6 @@ impl<'a> CompositionGraphBuilder<'a> {
             }
         }
 
-        self.graph.unify_imported_resources();
-
         Ok((self.instances[root_instance], self.graph))
     }
 }
@@ -542,7 +540,7 @@ impl<'a> ComponentComposer<'a> {
         CompositionGraphEncoder::new(
             EncodeOptions {
                 define_components: !self.config.import_components,
-                export: Some(root_instance),
+                exports: graph.instances.keys().copied().collect(),
                 validate: false,
             },
             &graph,
