@@ -505,6 +505,12 @@ pub enum ComponentDefinedType<'a> {
     Own(u32),
     /// A borrowed handle to a resource.
     Borrow(u32),
+    /// TODO: docs
+    Future(Option<ComponentValType>),
+    /// TODO: docs
+    Stream(ComponentValType),
+    /// TODO: docs
+    Error,
 }
 
 impl<'a> ComponentDefinedType<'a> {
@@ -544,6 +550,9 @@ impl<'a> ComponentDefinedType<'a> {
             },
             0x69 => ComponentDefinedType::Own(reader.read()?),
             0x68 => ComponentDefinedType::Borrow(reader.read()?),
+            0x67 => ComponentDefinedType::Future(reader.read()?),
+            0x66 => ComponentDefinedType::Stream(reader.read()?),
+            0x65 => ComponentDefinedType::Error,
             x => return reader.invalid_leading_byte(x, "component defined type"),
         })
     }

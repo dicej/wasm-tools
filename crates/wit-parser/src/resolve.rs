@@ -18,7 +18,7 @@ use crate::ast::{parse_use_path, ParsedUsePath};
 use crate::serde_::{serialize_arena, serialize_id_map};
 use crate::{
     AstItem, Docs, Error, Function, FunctionKind, Handle, IncludeName, Interface, InterfaceId,
-    InterfaceSpan, Mangling, PackageName, Results, SourceMap, Stability, Type, TypeDef,
+    InterfaceSpan, Mangling, PackageName, Result_, Results, SourceMap, Stability, Type, TypeDef,
     TypeDefKind, TypeId, TypeIdVisitor, TypeOwner, UnresolvedPackage, UnresolvedPackageGroup,
     World, WorldId, WorldItem, WorldKey, WorldSpan,
 };
@@ -512,7 +512,8 @@ package {name} is defined in two different locations:\n\
                 | TypeDefKind::Option(_)
                 | TypeDefKind::Result(_)
                 | TypeDefKind::Future(_)
-                | TypeDefKind::Stream(_) => false,
+                | TypeDefKind::Stream(_)
+                | TypeDefKind::Error => false,
                 TypeDefKind::Type(t) => self.all_bits_valid(t),
 
                 TypeDefKind::Handle(h) => match h {
@@ -2361,6 +2362,145 @@ package {name} is defined in two different locations:\n\
             },
         }
     }
+
+    pub fn add_future_and_stream_results(&mut self) {
+        let err = Some(Type::Id(self.types.alloc(TypeDef {
+            kind: TypeDefKind::Error,
+            name: None,
+            docs: Docs::default(),
+            owner: TypeOwner::None,
+            stability: Stability::Unknown,
+        })));
+
+        self.types.alloc(TypeDef {
+            kind: TypeDefKind::Result(Result_ { ok: None, err }),
+            name: None,
+            docs: Docs::default(),
+            owner: TypeOwner::None,
+            stability: Stability::Unknown,
+        });
+
+        let types = self
+            .types
+            .iter()
+            .filter_map(|(id, ty)| match &ty.kind {
+                TypeDefKind::Future(_) | TypeDefKind::Stream(_) => Some(id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        for id in types {
+            match self.types[id].kind.clone() {
+                TypeDefKind::Future(ty) => {
+                    self.types.alloc(TypeDef {
+                        kind: TypeDefKind::Result(Result_ { ok: ty, err }),
+                        name: None,
+                        docs: Docs::default(),
+                        owner: TypeOwner::None,
+                        stability: Stability::Unknown,
+                    });
+                }
+                TypeDefKind::Stream(ty) => {
+                    let ok = Some(Type::Id(self.types.alloc(TypeDef {
+                        kind: TypeDefKind::List(ty),
+                        name: None,
+                        docs: Docs::default(),
+                        owner: TypeOwner::None,
+                        stability: Stability::Unknown,
+                    })));
+                    let result = Type::Id(self.types.alloc(TypeDef {
+                        kind: TypeDefKind::Result(Result_ { ok, err }),
+                        name: None,
+                        docs: Docs::default(),
+                        owner: TypeOwner::None,
+                        stability: Stability::Unknown,
+                    }));
+                    self.types.alloc(TypeDef {
+                        kind: TypeDefKind::Option(result),
+                        name: None,
+                        docs: Docs::default(),
+                        owner: TypeOwner::None,
+                        stability: Stability::Unknown,
+                    });
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    pub fn find_future_and_stream_results(&self) -> (Option<TypeId>, HashMap<TypeId, TypeId>) {
+        #[derive(Copy, Clone, Hash, PartialEq, Eq)]
+        enum PayloadType {
+            Future(Option<Type>),
+            Stream(Type),
+        }
+
+        let mut unit_result = None;
+
+        let mut types = HashMap::<_, HashSet<_>>::new();
+        for (id, ty) in &self.types {
+            match &ty.kind {
+                TypeDefKind::Future(ty) => {
+                    types
+                        .entry(PayloadType::Future(*ty))
+                        .or_default()
+                        .insert(id);
+                }
+                TypeDefKind::Stream(ty) => {
+                    types
+                        .entry(PayloadType::Stream(*ty))
+                        .or_default()
+                        .insert(id);
+                }
+                _ => {}
+            }
+        }
+
+        let mut payload_results = HashMap::new();
+        for (id, ty) in &self.types {
+            match &ty.kind {
+                TypeDefKind::Option(Type::Id(ty)) => {
+                    if let TypeDefKind::Result(Result_ {
+                        ok: Some(Type::Id(ok)),
+                        err: Some(Type::Id(err)),
+                    }) = &self.types[*ty].kind
+                    {
+                        if let (TypeDefKind::List(ok), TypeDefKind::Error) =
+                            (&self.types[*ok].kind, &self.types[*err].kind)
+                        {
+                            if let Some(types) = types.get(&PayloadType::Stream(*ok)) {
+                                for ty in types {
+                                    payload_results.insert(*ty, id);
+                                }
+                            }
+                        }
+                    }
+                }
+                TypeDefKind::Result(Result_ {
+                    ok,
+                    err: Some(Type::Id(err)),
+                }) => {
+                    if let TypeDefKind::Error = &self.types[*err].kind {
+                        if let Some(types) = types.get(&PayloadType::Future(*ok)) {
+                            for ty in types {
+                                payload_results.insert(*ty, id);
+                            }
+                        }
+                        if ok.is_none() {
+                            unit_result = Some(id);
+                        }
+                    }
+                }
+                _ => (),
+            }
+        }
+
+        if unit_result.is_none() {
+            eprintln!("couldn't find unit result in {:#?}", self.types);
+        }
+
+        (unit_result, payload_results)
+    }
 }
 
 /// Possible imports that can be passed to [`Resolve::wasm_import_name`].
@@ -2919,7 +3059,7 @@ impl Remap {
                     }
                 }
             }
-            Option(t) => self.update_ty(resolve, t, span)?,
+            Option(t) | List(t) | Stream(t) => self.update_ty(resolve, t, span)?,
             Result(r) => {
                 if let Some(ty) = &mut r.ok {
                     self.update_ty(resolve, ty, span)?;
@@ -2928,16 +3068,8 @@ impl Remap {
                     self.update_ty(resolve, ty, span)?;
                 }
             }
-            List(t) => self.update_ty(resolve, t, span)?,
             Future(Some(t)) => self.update_ty(resolve, t, span)?,
-            Stream(t) => {
-                if let Some(ty) = &mut t.element {
-                    self.update_ty(resolve, ty, span)?;
-                }
-                if let Some(ty) = &mut t.end {
-                    self.update_ty(resolve, ty, span)?;
-                }
-            }
+            Error => {}
 
             // Note that `update_ty` is specifically not used here as typedefs
             // because for the `type a = b` form that doesn't force `a` to be a
@@ -3328,18 +3460,15 @@ impl Remap {
             TypeDefKind::Flags(_) => false,
             TypeDefKind::Tuple(t) => t.types.iter().any(|t| self.type_has_borrow(resolve, t)),
             TypeDefKind::Enum(_) => false,
-            TypeDefKind::List(ty) | TypeDefKind::Future(Some(ty)) | TypeDefKind::Option(ty) => {
-                self.type_has_borrow(resolve, ty)
-            }
+            TypeDefKind::List(ty)
+            | TypeDefKind::Future(Some(ty))
+            | TypeDefKind::Stream(ty)
+            | TypeDefKind::Option(ty) => self.type_has_borrow(resolve, ty),
             TypeDefKind::Result(r) => [&r.ok, &r.err]
                 .iter()
                 .filter_map(|t| t.as_ref())
                 .any(|t| self.type_has_borrow(resolve, t)),
-            TypeDefKind::Stream(r) => [&r.element, &r.end]
-                .iter()
-                .filter_map(|t| t.as_ref())
-                .any(|t| self.type_has_borrow(resolve, t)),
-            TypeDefKind::Future(None) => false,
+            TypeDefKind::Future(None) | TypeDefKind::Error => false,
             TypeDefKind::Unknown => unreachable!(),
         }
     }

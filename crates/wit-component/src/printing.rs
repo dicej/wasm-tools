@@ -540,6 +540,7 @@ impl WitPrinter {
                     TypeDefKind::Stream(_) => {
                         todo!("document has an unnamed stream type")
                     }
+                    TypeDefKind::Error => self.output.push_str("error"),
                     TypeDefKind::Unknown => unreachable!(),
                 }
             }
@@ -697,6 +698,7 @@ impl WitPrinter {
                     },
                     TypeDefKind::Future(_) => todo!("declare future"),
                     TypeDefKind::Stream(_) => todo!("declare stream"),
+                    TypeDefKind::Error => todo!("declare error"),
                     TypeDefKind::Unknown => unreachable!(),
                 }
             }

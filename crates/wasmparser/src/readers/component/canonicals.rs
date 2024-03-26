@@ -23,6 +23,10 @@ pub enum CanonicalOption {
     /// The post-return function to use if the lifting of a function requires
     /// cleanup after the function returns.
     PostReturn(u32),
+    /// TODO: docs
+    Async,
+    /// TODO: docs
+    Callback(u32),
 }
 
 /// Represents a canonical function in a WebAssembly component.
@@ -68,6 +72,85 @@ pub enum CanonicalFunction {
     /// A function which returns the number of threads that can be expected to
     /// execute concurrently
     ThreadHwConcurrency,
+    /// TODO: docs
+    AsyncStart {
+        /// TODO: docs
+        component_type_index: u32,
+    },
+    /// TODO: docs
+    AsyncReturn {
+        /// TODO: docs
+        component_type_index: u32,
+    },
+    /// TODO: docs
+    FutureNew {
+        /// TODO: docs
+        ty: u32,
+        /// TODO: docs
+        memory: u32,
+    },
+    /// TODO: docs
+    FutureSend {
+        /// TODO: docs
+        ty: u32,
+        /// TODO: docs
+        options: Box<[CanonicalOption]>,
+    },
+    /// TODO: docs
+    FutureReceive {
+        /// TODO: docs
+        ty: u32,
+        /// TODO: docs
+        options: Box<[CanonicalOption]>,
+    },
+    /// TODO: docs
+    FutureDropSender {
+        /// TODO: docs
+        ty: u32,
+    },
+    /// TODO: docs
+    FutureDropReceiver {
+        /// TODO: docs
+        ty: u32,
+    },
+    /// TODO: docs
+    StreamNew {
+        /// TODO: docs
+        ty: u32,
+        /// TODO: docs
+        memory: u32,
+    },
+    /// TODO: docs
+    StreamSend {
+        /// TODO: docs
+        ty: u32,
+        /// TODO: docs
+        options: Box<[CanonicalOption]>,
+    },
+    /// TODO: docs
+    StreamReceive {
+        /// TODO: docs
+        ty: u32,
+        /// TODO: docs
+        options: Box<[CanonicalOption]>,
+    },
+    /// TODO: docs
+    StreamDropSender {
+        /// TODO: docs
+        ty: u32,
+    },
+    /// TODO: docs
+    StreamDropReceiver {
+        /// TODO: docs
+        ty: u32,
+    },
+    /// TODO: docs
+    ErrorDrop,
+    /// TODO: docs
+    TaskWait {
+        /// TODO: docs
+        memory: u32,
+    },
 }
 
 /// A reader for the canonical section of a WebAssembly component.
@@ -113,6 +196,52 @@ impl<'a> FromReader<'a> for CanonicalFunction {
                 func_ty_index: reader.read()?,
             },
             0x06 => CanonicalFunction::ThreadHwConcurrency,
+            0x09 => CanonicalFunction::AsyncStart {
+                component_type_index: reader.read()?,
+            },
+            0x0a => CanonicalFunction::AsyncReturn {
+                component_type_index: reader.read()?,
+            },
+            0xff => CanonicalFunction::FutureNew {
+                ty: reader.read()?,
+                memory: reader.read()?,
+            },
+            0xfe => CanonicalFunction::FutureSend {
+                ty: reader.read()?,
+                options: reader
+                    .read_iter(MAX_WASM_CANONICAL_OPTIONS, "canonical options")?
+                    .collect::<Result<_>>()?,
+            },
+            0xfd => CanonicalFunction::FutureReceive {
+                ty: reader.read()?,
+                options: reader
+                    .read_iter(MAX_WASM_CANONICAL_OPTIONS, "canonical options")?
+                    .collect::<Result<_>>()?,
+            },
+            0xfc => CanonicalFunction::FutureDropSender { ty: reader.read()? },
+            0xfb => CanonicalFunction::FutureDropReceiver { ty: reader.read()? },
+            0xfa => CanonicalFunction::StreamNew {
+                ty: reader.read()?,
+                memory: reader.read()?,
+            },
+            0xf9 => CanonicalFunction::StreamSend {
+                ty: reader.read()?,
+                options: reader
+                    .read_iter(MAX_WASM_CANONICAL_OPTIONS, "canonical options")?
+                    .collect::<Result<_>>()?,
+            },
+            0xf8 => CanonicalFunction::StreamReceive {
+                ty: reader.read()?,
+                options: reader
+                    .read_iter(MAX_WASM_CANONICAL_OPTIONS, "canonical options")?
+                    .collect::<Result<_>>()?,
+            },
+            0xf7 => CanonicalFunction::StreamDropSender { ty: reader.read()? },
+            0xf6 => CanonicalFunction::StreamDropReceiver { ty: reader.read()? },
+            0xf5 => CanonicalFunction::ErrorDrop,
+            0x0b => CanonicalFunction::TaskWait {
+                memory: reader.read()?,
+            },
             x => return reader.invalid_leading_byte(x, "canonical function"),
         })
     }
@@ -127,6 +256,8 @@ impl<'a> FromReader<'a> for CanonicalOption {
             0x03 => CanonicalOption::Memory(reader.read_var_u32()?),
             0x04 => CanonicalOption::Realloc(reader.read_var_u32()?),
             0x05 => CanonicalOption::PostReturn(reader.read_var_u32()?),
+            0x06 => CanonicalOption::Async,
+            0x07 => CanonicalOption::Callback(reader.read_var_u32()?),
             x => return reader.invalid_leading_byte(x, "canonical option"),
         })
     }

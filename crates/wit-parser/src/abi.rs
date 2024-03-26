@@ -121,12 +121,14 @@ impl From<Int> for WasmType {
 /// variants of the ABI, one specialized for the "guest" importing and calling
 /// a function defined and exported in the "host", and the other specialized for
 /// the "host" importing and calling a function defined and exported in the "guest".
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum AbiVariant {
     /// The guest is importing and calling the function.
     GuestImport,
     /// The guest is defining and exporting the function.
     GuestExport,
+    GuestImportAsync,
+    GuestExportAsync,
 }
 
 impl Resolve {
@@ -135,6 +137,26 @@ impl Resolve {
     /// The first entry returned is the list of parameters and the second entry
     /// is the list of results for the wasm function signature.
     pub fn wasm_signature(&self, variant: AbiVariant, func: &Function) -> WasmSignature {
+        match variant {
+            AbiVariant::GuestExportAsync => {
+                return WasmSignature {
+                    params: Vec::new(),
+                    indirect_params: false,
+                    results: vec![WasmType::Pointer],
+                    retptr: false,
+                }
+            }
+            AbiVariant::GuestImportAsync => {
+                return WasmSignature {
+                    params: vec![WasmType::Pointer; 3],
+                    indirect_params: true,
+                    results: vec![WasmType::I32],
+                    retptr: true,
+                }
+            }
+            _ => {}
+        }
+
         const MAX_FLAT_PARAMS: usize = 16;
         const MAX_FLAT_RESULTS: usize = 1;
 
@@ -185,6 +207,7 @@ impl Resolve {
                 AbiVariant::GuestExport => {
                     results.push(WasmType::Pointer);
                 }
+                _ => unreachable!(),
             }
         }
 
@@ -271,6 +294,10 @@ impl Resolve {
                 }
 
                 TypeDefKind::Stream(_) => {
+                    result.push(WasmType::I32);
+                }
+
+                TypeDefKind::Error => {
                     result.push(WasmType::I32);
                 }
 

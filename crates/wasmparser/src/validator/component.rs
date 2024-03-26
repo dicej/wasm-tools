@@ -21,9 +21,9 @@ use crate::types::{
 use crate::validator::names::{ComponentName, ComponentNameKind, KebabStr, KebabString};
 use crate::{
     BinaryReaderError, CanonicalOption, ComponentExportName, ComponentExternalKind,
-    ComponentOuterAliasKind, ComponentTypeRef, CompositeInnerType, ExternalKind, FuncType,
-    GlobalType, InstantiationArgKind, MemoryType, PackedIndex, RefType, Result, SubType, TableType,
-    TypeBounds, ValType, WasmFeatures,
+    ComponentOuterAliasKind, ComponentTypeRef, CompositeInnerType, CompositeType, ExternalKind,
+    FuncType, GlobalType, InstantiationArgKind, MemoryType, PackedIndex, RecGroup, RefType, Result,
+    SubType, TableType, TypeBounds, ValType, WasmFeatures,
 };
 use core::mem;
 
@@ -723,7 +723,8 @@ impl ComponentState {
             // named.
             ComponentDefinedType::Primitive(_)
             | ComponentDefinedType::Flags(_)
-            | ComponentDefinedType::Enum(_) => true,
+            | ComponentDefinedType::Enum(_)
+            | ComponentDefinedType::Error => true,
 
             // Referenced types of all these aggregates must all be
             // named.
@@ -755,6 +756,12 @@ impl ComponentState {
             ComponentDefinedType::Own(id) | ComponentDefinedType::Borrow(id) => {
                 set.contains(&ComponentAnyTypeId::from(*id))
             }
+
+            ComponentDefinedType::Future(ty) => ty
+                .as_ref()
+                .map(|ty| types.type_named_valtype(ty, set))
+                .unwrap_or(true),
+            ComponentDefinedType::Stream(ty) => types.type_named_valtype(ty, set),
         }
     }
 
@@ -957,7 +964,7 @@ impl ComponentState {
 
         // Lifting a function is for an export, so match the expected canonical ABI
         // export signature
-        let info = ty.lower(types, false);
+        let info = ty.lower(types, false, options.contains(&CanonicalOption::Async));
         self.check_options(Some(core_ty), &info, &options, types, offset)?;
 
         if core_ty.params() != info.params.as_slice() {
@@ -997,7 +1004,7 @@ impl ComponentState {
 
         // Lowering a function is for an import, so use a function type that matches
         // the expected canonical ABI import signature.
-        let info = ty.lower(types, true);
+        let info = ty.lower(types, true, options.contains(&CanonicalOption::Async));
 
         self.check_options(None, &info, &options, types, offset)?;
 
@@ -1046,6 +1053,396 @@ impl ComponentState {
         let func_ty = FuncType::new([ValType::I32], [rep]);
         let core_ty = SubType::func(func_ty, false);
         let id = types.intern_sub_type(core_ty, offset);
+        self.core_funcs.push(id);
+        Ok(())
+    }
+
+    pub fn async_start(
+        &mut self,
+        component_type_index: u32,
+        types: &mut TypeAlloc,
+        offset: usize,
+    ) -> Result<()> {
+        let mut component_type = self
+            .function_type_at(component_type_index, types, offset)?
+            .clone();
+        component_type.results = Vec::from(mem::replace(&mut component_type.params, Box::new([])))
+            .into_iter()
+            .map(|(k, v)| (Some(k), v))
+            .collect();
+        let info = component_type.lower(types, true, false);
+
+        let (_is_new, group_id) = types.intern_canonical_rec_group(RecGroup::implicit(
+            offset,
+            SubType {
+                is_final: true,
+                supertype_idx: None,
+                composite_type: CompositeType {
+                    shared: false,
+                    inner: CompositeInnerType::Func(FuncType::new(
+                        info.params.iter(),
+                        info.results.iter(),
+                    )),
+                },
+            },
+        ));
+        let id = types[group_id].start;
+        self.core_funcs.push(id);
+        Ok(())
+    }
+
+    pub fn async_return(
+        &mut self,
+        component_type_index: u32,
+        types: &mut TypeAlloc,
+        offset: usize,
+    ) -> Result<()> {
+        let mut component_type = self
+            .function_type_at(component_type_index, types, offset)?
+            .clone();
+        component_type.params = Vec::from(mem::replace(&mut component_type.results, Box::new([])))
+            .into_iter()
+            .enumerate()
+            .map(|(index, (k, v))| {
+                (
+                    k.unwrap_or_else(|| KebabString::new(format!("p{index}")).unwrap()),
+                    v,
+                )
+            })
+            .collect();
+        let info = component_type.lower(types, true, false);
+
+        let (_is_new, group_id) = types.intern_canonical_rec_group(RecGroup::implicit(
+            offset,
+            SubType {
+                is_final: true,
+                supertype_idx: None,
+                composite_type: CompositeType {
+                    shared: false,
+                    inner: CompositeInnerType::Func(FuncType::new(
+                        info.params.iter(),
+                        info.results.iter(),
+                    )),
+                },
+            },
+        ));
+        let id = types[group_id].start;
+        self.core_funcs.push(id);
+        Ok(())
+    }
+
+    pub fn future_new(
+        &mut self,
+        ty: u32,
+        memory: u32,
+        types: &mut TypeAlloc,
+        offset: usize,
+    ) -> Result<()> {
+        self.defined_type_at(ty, offset)?;
+        self.memory_at(memory, offset)?;
+
+        let (_is_new, group_id) = types.intern_canonical_rec_group(RecGroup::implicit(
+            offset,
+            SubType {
+                is_final: true,
+                supertype_idx: None,
+                composite_type: CompositeType {
+                    shared: false,
+                    inner: CompositeInnerType::Func(FuncType::new([ValType::I32], [])),
+                },
+            },
+        ));
+        let id = types[group_id].start;
+        self.core_funcs.push(id);
+        Ok(())
+    }
+
+    pub fn future_send(
+        &mut self,
+        ty: u32,
+        options: Vec<CanonicalOption>,
+        types: &mut TypeAlloc,
+        offset: usize,
+    ) -> Result<()> {
+        self.defined_type_at(ty, offset)?;
+
+        let mut info = LoweringInfo::default();
+        info.requires_memory = true;
+        info.requires_realloc = false;
+        self.check_options(None, &info, &options, types, offset)?;
+
+        let (_is_new, group_id) = types.intern_canonical_rec_group(RecGroup::implicit(
+            offset,
+            SubType {
+                is_final: true,
+                supertype_idx: None,
+                composite_type: CompositeType {
+                    shared: false,
+                    inner: CompositeInnerType::Func(FuncType::new(
+                        [ValType::I32; 3],
+                        [ValType::I32],
+                    )),
+                },
+            },
+        ));
+        let id = types[group_id].start;
+        self.core_funcs.push(id);
+        Ok(())
+    }
+
+    pub fn future_receive(
+        &mut self,
+        ty: u32,
+        options: Vec<CanonicalOption>,
+        types: &mut TypeAlloc,
+        offset: usize,
+    ) -> Result<()> {
+        let ty = self.defined_type_at(ty, offset)?;
+
+        let mut info = LoweringInfo::default();
+        info.requires_memory = true;
+        info.requires_realloc = ComponentValType::Type(ty).contains_ptr(types);
+        self.check_options(None, &info, &options, types, offset)?;
+
+        let (_is_new, group_id) = types.intern_canonical_rec_group(RecGroup::implicit(
+            offset,
+            SubType {
+                is_final: true,
+                supertype_idx: None,
+                composite_type: CompositeType {
+                    shared: false,
+                    inner: CompositeInnerType::Func(FuncType::new(
+                        [ValType::I32; 3],
+                        [ValType::I32],
+                    )),
+                },
+            },
+        ));
+        let id = types[group_id].start;
+        self.core_funcs.push(id);
+        Ok(())
+    }
+
+    pub fn future_drop_sender(
+        &mut self,
+        ty: u32,
+        types: &mut TypeAlloc,
+        offset: usize,
+    ) -> Result<()> {
+        self.defined_type_at(ty, offset)?;
+
+        let (_is_new, group_id) = types.intern_canonical_rec_group(RecGroup::implicit(
+            offset,
+            SubType {
+                is_final: true,
+                supertype_idx: None,
+                composite_type: CompositeType {
+                    shared: false,
+                    inner: CompositeInnerType::Func(FuncType::new([ValType::I32], [])),
+                },
+            },
+        ));
+        let id = types[group_id].start;
+        self.core_funcs.push(id);
+        Ok(())
+    }
+
+    pub fn future_drop_receiver(
+        &mut self,
+        ty: u32,
+        types: &mut TypeAlloc,
+        offset: usize,
+    ) -> Result<()> {
+        self.defined_type_at(ty, offset)?;
+
+        let (_is_new, group_id) = types.intern_canonical_rec_group(RecGroup::implicit(
+            offset,
+            SubType {
+                is_final: true,
+                supertype_idx: None,
+                composite_type: CompositeType {
+                    shared: false,
+                    inner: CompositeInnerType::Func(FuncType::new([ValType::I32], [])),
+                },
+            },
+        ));
+        let id = types[group_id].start;
+        self.core_funcs.push(id);
+        Ok(())
+    }
+
+    pub fn stream_new(
+        &mut self,
+        ty: u32,
+        memory: u32,
+        types: &mut TypeAlloc,
+        offset: usize,
+    ) -> Result<()> {
+        self.defined_type_at(ty, offset)?;
+        self.memory_at(memory, offset)?;
+
+        let (_is_new, group_id) = types.intern_canonical_rec_group(RecGroup::implicit(
+            offset,
+            SubType {
+                is_final: true,
+                supertype_idx: None,
+                composite_type: CompositeType {
+                    shared: false,
+                    inner: CompositeInnerType::Func(FuncType::new([ValType::I32], [])),
+                },
+            },
+        ));
+        let id = types[group_id].start;
+        self.core_funcs.push(id);
+        Ok(())
+    }
+
+    pub fn stream_send(
+        &mut self,
+        ty: u32,
+        options: Vec<CanonicalOption>,
+        types: &mut TypeAlloc,
+        offset: usize,
+    ) -> Result<()> {
+        self.defined_type_at(ty, offset)?;
+
+        let mut info = LoweringInfo::default();
+        info.requires_memory = true;
+        info.requires_realloc = false;
+        self.check_options(None, &info, &options, types, offset)?;
+
+        let (_is_new, group_id) = types.intern_canonical_rec_group(RecGroup::implicit(
+            offset,
+            SubType {
+                is_final: true,
+                supertype_idx: None,
+                composite_type: CompositeType {
+                    shared: false,
+                    inner: CompositeInnerType::Func(FuncType::new(
+                        [ValType::I32; 3],
+                        [ValType::I32],
+                    )),
+                },
+            },
+        ));
+        let id = types[group_id].start;
+        self.core_funcs.push(id);
+        Ok(())
+    }
+
+    pub fn stream_receive(
+        &mut self,
+        ty: u32,
+        options: Vec<CanonicalOption>,
+        types: &mut TypeAlloc,
+        offset: usize,
+    ) -> Result<()> {
+        self.defined_type_at(ty, offset)?;
+
+        let mut info = LoweringInfo::default();
+        info.requires_memory = true;
+        info.requires_realloc = true;
+        self.check_options(None, &info, &options, types, offset)?;
+
+        let (_is_new, group_id) = types.intern_canonical_rec_group(RecGroup::implicit(
+            offset,
+            SubType {
+                is_final: true,
+                supertype_idx: None,
+                composite_type: CompositeType {
+                    shared: false,
+                    inner: CompositeInnerType::Func(FuncType::new(
+                        [ValType::I32; 3],
+                        [ValType::I32],
+                    )),
+                },
+            },
+        ));
+        let id = types[group_id].start;
+        self.core_funcs.push(id);
+        Ok(())
+    }
+
+    pub fn stream_drop_sender(
+        &mut self,
+        ty: u32,
+        types: &mut TypeAlloc,
+        offset: usize,
+    ) -> Result<()> {
+        self.defined_type_at(ty, offset)?;
+
+        let (_is_new, group_id) = types.intern_canonical_rec_group(RecGroup::implicit(
+            offset,
+            SubType {
+                is_final: true,
+                supertype_idx: None,
+                composite_type: CompositeType {
+                    shared: false,
+                    inner: CompositeInnerType::Func(FuncType::new([ValType::I32], [])),
+                },
+            },
+        ));
+        let id = types[group_id].start;
+        self.core_funcs.push(id);
+        Ok(())
+    }
+
+    pub fn stream_drop_receiver(
+        &mut self,
+        ty: u32,
+        types: &mut TypeAlloc,
+        offset: usize,
+    ) -> Result<()> {
+        self.defined_type_at(ty, offset)?;
+
+        let (_is_new, group_id) = types.intern_canonical_rec_group(RecGroup::implicit(
+            offset,
+            SubType {
+                is_final: true,
+                supertype_idx: None,
+                composite_type: CompositeType {
+                    shared: false,
+                    inner: CompositeInnerType::Func(FuncType::new([ValType::I32], [])),
+                },
+            },
+        ));
+        let id = types[group_id].start;
+        self.core_funcs.push(id);
+        Ok(())
+    }
+
+    pub fn error_drop(&mut self, types: &mut TypeAlloc, offset: usize) -> Result<()> {
+        let (_is_new, group_id) = types.intern_canonical_rec_group(RecGroup::implicit(
+            offset,
+            SubType {
+                is_final: true,
+                supertype_idx: None,
+                composite_type: CompositeType {
+                    shared: false,
+                    inner: CompositeInnerType::Func(FuncType::new([ValType::I32], [])),
+                },
+            },
+        ));
+        let id = types[group_id].start;
+        self.core_funcs.push(id);
+        Ok(())
+    }
+
+    pub fn task_wait(&mut self, memory: u32, types: &mut TypeAlloc, offset: usize) -> Result<()> {
+        self.memory_at(memory, offset)?;
+
+        let (_is_new, group_id) = types.intern_canonical_rec_group(RecGroup::implicit(
+            offset,
+            SubType {
+                is_final: true,
+                supertype_idx: None,
+                composite_type: CompositeType {
+                    shared: false,
+                    inner: CompositeInnerType::Func(FuncType::new([ValType::I32], [ValType::I32])),
+                },
+            },
+        ));
+        let id = types[group_id].start;
         self.core_funcs.push(id);
         Ok(())
     }
@@ -1304,6 +1701,8 @@ impl ComponentState {
                 CanonicalOption::Memory(_) => "memory",
                 CanonicalOption::Realloc(_) => "realloc",
                 CanonicalOption::PostReturn(_) => "post-return",
+                CanonicalOption::Async => "async",
+                CanonicalOption::Callback(_) => "callback",
             }
         }
 
@@ -1392,6 +1791,8 @@ impl ComponentState {
                         }
                     }
                 }
+                // TODO
+                CanonicalOption::Async | CanonicalOption::Callback(_) => {}
             }
         }
 
@@ -1820,7 +2221,7 @@ impl ComponentState {
             cx.entity_type(arg, expected, offset).with_context(|| {
                 format!(
                     "type mismatch for export `{name}` of module \
-                         instantiation argument `{module}`"
+                     instantiation argument `{module}`"
                 )
             })?;
         }
@@ -2601,6 +3002,14 @@ impl ComponentState {
             crate::ComponentDefinedType::Borrow(idx) => Ok(ComponentDefinedType::Borrow(
                 self.resource_at(idx, types, offset)?,
             )),
+            crate::ComponentDefinedType::Future(ty) => Ok(ComponentDefinedType::Future(
+                ty.map(|ty| self.create_component_val_type(ty, offset))
+                    .transpose()?,
+            )),
+            crate::ComponentDefinedType::Stream(ty) => Ok(ComponentDefinedType::Stream(
+                self.create_component_val_type(ty, offset)?,
+            )),
+            crate::ComponentDefinedType::Error => Ok(ComponentDefinedType::Error),
         }
     }
 

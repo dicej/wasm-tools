@@ -599,6 +599,17 @@ impl<'a> TypeEncoder<'a> {
                 return ret;
             }
 
+            if let Some((instance, name)) = state.cur.instance_exports.get(&key) {
+                let ret = state.cur.encodable.type_count();
+                state.cur.encodable.alias(Alias::InstanceExport {
+                    instance: *instance,
+                    name,
+                    kind: ComponentExportKind::Type,
+                });
+                log::trace!("id defined in current instance");
+                return ret;
+            }
+
             match id.peel_alias(&self.0.types) {
                 Some(next) => id = next,
                 // If there's no more aliases then fall through to the
@@ -611,15 +622,17 @@ impl<'a> TypeEncoder<'a> {
         return match id {
             AnyTypeId::Core(ComponentCoreTypeId::Sub(_)) => unreachable!(),
             AnyTypeId::Core(ComponentCoreTypeId::Module(id)) => self.module_type(state, id),
-            AnyTypeId::Component(id) => match id {
-                ComponentAnyTypeId::Resource(_) => {
-                    unreachable!("should have been handled in `TypeEncoder::component_entity_type`")
+            AnyTypeId::Component(id) => {
+                match id {
+                    ComponentAnyTypeId::Resource(r) => {
+                        unreachable!("should have been handled in `TypeEncoder::component_entity_type`: {r:?}")
+                    }
+                    ComponentAnyTypeId::Defined(id) => self.defined_type(state, id),
+                    ComponentAnyTypeId::Func(id) => self.component_func_type(state, id),
+                    ComponentAnyTypeId::Instance(id) => self.component_instance_type(state, id),
+                    ComponentAnyTypeId::Component(id) => self.component_type(state, id),
                 }
-                ComponentAnyTypeId::Defined(id) => self.defined_type(state, id),
-                ComponentAnyTypeId::Func(id) => self.component_func_type(state, id),
-                ComponentAnyTypeId::Instance(id) => self.component_instance_type(state, id),
-                ComponentAnyTypeId::Component(id) => self.component_type(state, id),
-            },
+            }
         };
     }
 
@@ -678,6 +691,9 @@ impl<'a> TypeEncoder<'a> {
                 state.cur.encodable.ty().defined_type().borrow(ty);
                 index
             }
+            wasmparser::types::ComponentDefinedType::Future(ty) => self.future(state, *ty),
+            wasmparser::types::ComponentDefinedType::Stream(ty) => self.stream(state, *ty),
+            wasmparser::types::ComponentDefinedType::Error => self.error(state),
         }
     }
 
@@ -798,6 +814,32 @@ impl<'a> TypeEncoder<'a> {
             state.cur.add_type_export(key, name);
         }
         export
+    }
+
+    fn future(
+        &self,
+        state: &mut TypeState<'a>,
+        ty: Option<wasmparser::types::ComponentValType>,
+    ) -> u32 {
+        let ty = ty.map(|ty| self.component_val_type(state, ty));
+
+        let index = state.cur.encodable.type_count();
+        state.cur.encodable.ty().defined_type().future(ty);
+        index
+    }
+
+    fn stream(&self, state: &mut TypeState<'a>, ty: wasmparser::types::ComponentValType) -> u32 {
+        let ty = self.component_val_type(state, ty);
+
+        let index = state.cur.encodable.type_count();
+        state.cur.encodable.ty().defined_type().stream(ty);
+        index
+    }
+
+    fn error(&self, state: &mut TypeState<'a>) -> u32 {
+        let index = state.cur.encodable.type_count();
+        state.cur.encodable.ty().defined_type().error();
+        index
     }
 }
 
@@ -1226,10 +1268,11 @@ impl DependencyRegistrar<'_, '_> {
         match &self.types[ty] {
             types::ComponentDefinedType::Primitive(_)
             | types::ComponentDefinedType::Enum(_)
-            | types::ComponentDefinedType::Flags(_) => {}
-            types::ComponentDefinedType::List(t) | types::ComponentDefinedType::Option(t) => {
-                self.val_type(*t)
-            }
+            | types::ComponentDefinedType::Flags(_)
+            | types::ComponentDefinedType::Error => {}
+            types::ComponentDefinedType::List(t)
+            | types::ComponentDefinedType::Option(t)
+            | types::ComponentDefinedType::Stream(t) => self.val_type(*t),
             types::ComponentDefinedType::Own(r) | types::ComponentDefinedType::Borrow(r) => {
                 self.ty(ComponentAnyTypeId::Resource(*r))
             }
@@ -1256,6 +1299,11 @@ impl DependencyRegistrar<'_, '_> {
                 }
                 if let Some(err) = err {
                     self.val_type(*err);
+                }
+            }
+            types::ComponentDefinedType::Future(ty) => {
+                if let Some(ty) = ty {
+                    self.val_type(*ty);
                 }
             }
         }
@@ -1415,7 +1463,7 @@ impl<'a> CompositionGraphEncoder<'a> {
         state.push(Encodable::Instance(InstanceType::new()));
         for (name, types) in exports {
             let (component, ty) = types[0];
-            log::trace!("export {name}");
+            log::trace!("export {name}: {ty:?}");
             let export = TypeEncoder::new(component).export(name, ty, state);
             let t = match &mut state.cur.encodable {
                 Encodable::Instance(c) => c,
@@ -1431,6 +1479,7 @@ impl<'a> CompositionGraphEncoder<'a> {
                 }
             }
         }
+
         let instance_type = match state.pop() {
             Encodable::Instance(c) => c,
             _ => unreachable!(),

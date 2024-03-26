@@ -438,7 +438,7 @@ pub(crate) struct Instance {
 }
 
 /// The options for encoding a composition graph.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
 pub struct EncodeOptions {
     /// Whether or not to define instantiated components.
     ///
@@ -447,7 +447,7 @@ pub struct EncodeOptions {
 
     /// The instance in the graph to export.
     ///
-    /// If `Some`, the instance's exports will be aliased and
+    /// If non-empty, the instance's exports will be aliased and
     /// exported from the resulting component.
     pub export: Option<InstanceId>,
 
@@ -507,9 +507,6 @@ impl ResourceMapping {
                         if value.1 == export_resource {
                             self.map.insert(export_resource, value);
                             self.map.insert(import_resource, value);
-                        } else {
-                            // Can't set two different exports equal to each other -- give up.
-                            return None;
                         }
                     } else {
                         // Couldn't find an export with a name that matches this
@@ -558,14 +555,19 @@ impl<'a> CompositionGraph<'a> {
     /// connected to exports, group them by name, and update the resource
     /// mapping to make all resources within each group equivalent.
     ///
-    /// This should be the last step prior to encoding, after all
-    /// inter-component connections have been made.  It ensures that each set of
-    /// identical imports composed component can be merged into a single import
-    /// in the output component.
+    /// This ensures that each set of identical imports in the composed
+    /// components can be merged into a single import in the output component.
+    //
+    // TODO: How do we balance the need to call this early (so we can match up
+    // imports with exports which mutually import the same resources) with the
+    // need to delay decisions about where resources are coming from (so that we
+    // can match up imported resources with exported resources)?  Right now I
+    // think we're erring on the side if the former at the expense of the
+    // latter.
     pub(crate) fn unify_imported_resources(&self) {
         let mut resource_mapping = self.resource_mapping.borrow_mut();
 
-        let mut resource_imports = HashMap::<_, Vec<_>>::new();
+        let mut resource_imports = IndexMap::<_, IndexSet<_>>::new();
         for (component_id, component) in &self.components {
             let component = &component.component;
             for import_name in component.imports.keys() {
@@ -583,12 +585,14 @@ impl<'a> CompositionGraph<'a> {
                             ..
                         } = ty
                         {
-                            if !resource_mapping.map.contains_key(&resource_id.resource()) {
-                                resource_imports
-                                    .entry(vec![import_name.to_string(), export_name.to_string()])
-                                    .or_default()
-                                    .push((*component_id, resource_id.resource()))
+                            let set = resource_imports
+                                .entry(vec![import_name.to_string(), export_name.to_string()])
+                                .or_default();
+
+                            if let Some(pair) = resource_mapping.map.get(&resource_id.resource()) {
+                                set.insert(*pair);
                             }
+                            set.insert((*component_id, resource_id.resource()));
                         }
                     }
                 }
@@ -596,7 +600,7 @@ impl<'a> CompositionGraph<'a> {
         }
 
         for resources in resource_imports.values() {
-            match &resources[..] {
+            match &resources.iter().copied().collect::<Vec<_>>()[..] {
                 [] => unreachable!(),
                 [_] => {}
                 [first, rest @ ..] => {
@@ -652,10 +656,8 @@ impl<'a> CompositionGraph<'a> {
                 .remap_component_entity(&mut import_type, remapping);
             remapping.reset_type_cache();
 
-            if context
-                .component_entity_type(&export_type, &import_type, 0)
-                .is_ok()
-            {
+            let v = context.component_entity_type(&export_type, &import_type, 0);
+            if v.is_ok() {
                 *self.resource_mapping.borrow_mut() = resource_mapping;
                 true
             } else {
@@ -704,6 +706,10 @@ impl<'a> CompositionGraph<'a> {
         };
 
         assert!(self.components.insert(id, entry).is_none());
+
+        if self.components.len() > 1 {
+            self.unify_imported_resources();
+        }
 
         Ok(id)
     }

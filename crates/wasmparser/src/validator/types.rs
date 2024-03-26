@@ -1143,8 +1143,22 @@ impl TypeData for ComponentFuncType {
 impl ComponentFuncType {
     /// Lowers the component function type to core parameter and result types for the
     /// canonical ABI.
-    pub(crate) fn lower(&self, types: &TypeList, is_lower: bool) -> LoweringInfo {
+    pub(crate) fn lower(&self, types: &TypeList, is_lower: bool, async_: bool) -> LoweringInfo {
         let mut info = LoweringInfo::default();
+
+        if async_ {
+            if is_lower {
+                for _ in 0..3 {
+                    info.params.push(ValType::I32);
+                }
+                info.results.push(ValType::I32);
+                info.requires_memory = true;
+                info.requires_realloc = self.results.iter().any(|(_, ty)| ty.contains_ptr(types));
+            } else {
+                info.results.push(ValType::I32);
+            }
+            return info;
+        }
 
         for (_, ty) in self.params.iter() {
             // Check to see if `ty` has a pointer somewhere in it, needed for
@@ -1276,6 +1290,12 @@ pub enum ComponentDefinedType {
     Own(AliasableResourceId),
     /// The type is a borrowed handle to the specified resource.
     Borrow(AliasableResourceId),
+    /// TODO: docs
+    Future(Option<ComponentValType>),
+    /// TODO: docs
+    Stream(ComponentValType),
+    /// TODO: docs
+    Error,
 }
 
 impl TypeData for ComponentDefinedType {
@@ -1283,7 +1303,13 @@ impl TypeData for ComponentDefinedType {
 
     fn type_info(&self, types: &TypeList) -> TypeInfo {
         match self {
-            Self::Primitive(_) | Self::Flags(_) | Self::Enum(_) | Self::Own(_) => TypeInfo::new(),
+            Self::Primitive(_)
+            | Self::Flags(_)
+            | Self::Enum(_)
+            | Self::Own(_)
+            | Self::Future(_)
+            | Self::Stream(_)
+            | Self::Error => TypeInfo::new(),
             Self::Borrow(_) => TypeInfo::borrow(),
             Self::Record(r) => r.info,
             Self::Variant(v) => v.info,
@@ -1311,7 +1337,13 @@ impl ComponentDefinedType {
                 .any(|case| case.ty.map(|ty| ty.contains_ptr(types)).unwrap_or(false)),
             Self::List(_) => true,
             Self::Tuple(t) => t.types.iter().any(|ty| ty.contains_ptr(types)),
-            Self::Flags(_) | Self::Enum(_) | Self::Own(_) | Self::Borrow(_) => false,
+            Self::Flags(_)
+            | Self::Enum(_)
+            | Self::Own(_)
+            | Self::Borrow(_)
+            | Self::Future(_)
+            | Self::Stream(_)
+            | Self::Error => false,
             Self::Option(ty) => ty.contains_ptr(types),
             Self::Result { ok, err } => {
                 ok.map(|ty| ty.contains_ptr(types)).unwrap_or(false)
@@ -1340,7 +1372,12 @@ impl ComponentDefinedType {
             Self::Flags(names) => {
                 (0..(names.len() + 31) / 32).all(|_| lowered_types.push(ValType::I32))
             }
-            Self::Enum(_) | Self::Own(_) | Self::Borrow(_) => lowered_types.push(ValType::I32),
+            Self::Enum(_)
+            | Self::Own(_)
+            | Self::Borrow(_)
+            | Self::Future(_)
+            | Self::Stream(_)
+            | Self::Error => lowered_types.push(ValType::I32),
             Self::Option(ty) => {
                 Self::push_variant_wasm_types([ty].into_iter(), types, lowered_types)
             }
@@ -1408,6 +1445,9 @@ impl ComponentDefinedType {
             ComponentDefinedType::Result { .. } => "result",
             ComponentDefinedType::Own(_) => "own",
             ComponentDefinedType::Borrow(_) => "borrow",
+            ComponentDefinedType::Future(_) => "future",
+            ComponentDefinedType::Stream(_) => "stream",
+            ComponentDefinedType::Error => "error",
         }
     }
 }
@@ -1574,6 +1614,16 @@ impl<'a> TypesRef<'a> {
         match self.component_any_type_at(index) {
             ComponentAnyTypeId::Defined(id) => id,
             _ => panic!("not a defined type"),
+        }
+    }
+
+    /// TODO: docs
+    pub fn component_val_type(&self, ty: crate::ComponentValType) -> ComponentValType {
+        match ty {
+            crate::ComponentValType::Primitive(ty) => ComponentValType::Primitive(ty),
+            crate::ComponentValType::Type(ty) => {
+                ComponentValType::Type(self.component_defined_type_at(ty))
+            }
         }
     }
 
@@ -2868,7 +2918,8 @@ impl TypeAlloc {
         match &self[id] {
             ComponentDefinedType::Primitive(_)
             | ComponentDefinedType::Flags(_)
-            | ComponentDefinedType::Enum(_) => {}
+            | ComponentDefinedType::Enum(_)
+            | ComponentDefinedType::Error => {}
             ComponentDefinedType::Record(r) => {
                 for ty in r.fields.values() {
                     self.free_variables_valtype(ty, set);
@@ -2886,7 +2937,9 @@ impl TypeAlloc {
                     }
                 }
             }
-            ComponentDefinedType::List(ty) | ComponentDefinedType::Option(ty) => {
+            ComponentDefinedType::List(ty)
+            | ComponentDefinedType::Option(ty)
+            | ComponentDefinedType::Stream(ty) => {
                 self.free_variables_valtype(ty, set);
             }
             ComponentDefinedType::Result { ok, err } => {
@@ -2899,6 +2952,11 @@ impl TypeAlloc {
             }
             ComponentDefinedType::Own(id) | ComponentDefinedType::Borrow(id) => {
                 set.insert(id.resource());
+            }
+            ComponentDefinedType::Future(ty) => {
+                if let Some(ty) = ty {
+                    self.free_variables_valtype(ty, set);
+                }
             }
         }
     }
@@ -3000,7 +3058,7 @@ impl TypeAlloc {
         let ty = &self[id];
         match ty {
             // Primitives are always considered named
-            ComponentDefinedType::Primitive(_) => true,
+            ComponentDefinedType::Primitive(_) | ComponentDefinedType::Error => true,
 
             // These structures are never allowed to be anonymous, so they
             // themselves must be named.
@@ -3023,15 +3081,20 @@ impl TypeAlloc {
                         .map(|t| self.type_named_valtype(t, set))
                         .unwrap_or(true)
             }
-            ComponentDefinedType::List(ty) | ComponentDefinedType::Option(ty) => {
-                self.type_named_valtype(ty, set)
-            }
+            ComponentDefinedType::List(ty)
+            | ComponentDefinedType::Option(ty)
+            | ComponentDefinedType::Stream(ty) => self.type_named_valtype(ty, set),
 
             // own/borrow themselves don't have to be named, but the resource
             // they refer to must be named.
             ComponentDefinedType::Own(id) | ComponentDefinedType::Borrow(id) => {
                 set.contains(&ComponentAnyTypeId::from(*id))
             }
+
+            ComponentDefinedType::Future(ty) => ty
+                .as_ref()
+                .map(|ty| self.type_named_valtype(ty, set))
+                .unwrap_or(true),
         }
     }
 
@@ -3182,7 +3245,8 @@ where
         match &mut tmp {
             ComponentDefinedType::Primitive(_)
             | ComponentDefinedType::Flags(_)
-            | ComponentDefinedType::Enum(_) => {}
+            | ComponentDefinedType::Enum(_)
+            | ComponentDefinedType::Error => {}
             ComponentDefinedType::Record(r) => {
                 for ty in r.fields.values_mut() {
                     any_changed |= self.remap_valtype(ty, map);
@@ -3200,7 +3264,9 @@ where
                     }
                 }
             }
-            ComponentDefinedType::List(ty) | ComponentDefinedType::Option(ty) => {
+            ComponentDefinedType::List(ty)
+            | ComponentDefinedType::Option(ty)
+            | ComponentDefinedType::Stream(ty) => {
                 any_changed |= self.remap_valtype(ty, map);
             }
             ComponentDefinedType::Result { ok, err } => {
@@ -3213,6 +3279,11 @@ where
             }
             ComponentDefinedType::Own(id) | ComponentDefinedType::Borrow(id) => {
                 any_changed |= self.remap_resource_id(id, map);
+            }
+            ComponentDefinedType::Future(ty) => {
+                if let Some(ty) = ty {
+                    any_changed |= self.remap_valtype(ty, map);
+                }
             }
         }
         self.insert_if_any_changed(map, any_changed, id, tmp)
@@ -4153,6 +4224,21 @@ impl<'a> SubtypeCx<'a> {
             }
             (Own(_), b) => bail!(offset, "expected {}, found own", b.desc()),
             (Borrow(_), b) => bail!(offset, "expected {}, found borrow", b.desc()),
+            (Future(a), Future(b)) => match (a, b) {
+                (None, None) => Ok(()),
+                (Some(a), Some(b)) => self
+                    .component_val_type(a, b, offset)
+                    .with_context(|| "type mismatch in future"),
+                (None, Some(_)) => bail!(offset, "expected future type, but found none"),
+                (Some(_), None) => bail!(offset, "expected future type to not be present"),
+            },
+            (Future(_), b) => bail!(offset, "expected {}, found future", b.desc()),
+            (Stream(a), Stream(b)) => self
+                .component_val_type(a, b, offset)
+                .with_context(|| "type mismatch in stream"),
+            (Stream(_), b) => bail!(offset, "expected {}, found stream", b.desc()),
+            (Error, Error) => Ok(()),
+            (Error, b) => bail!(offset, "expected {}, found error", b.desc()),
         }
     }
 

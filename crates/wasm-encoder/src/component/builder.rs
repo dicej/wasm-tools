@@ -316,7 +316,7 @@ impl ComponentBuilder {
         (inc(&mut self.types), self.types().function())
     }
 
-    /// Declares a
+    /// Declares a new resource type within this component.
     pub fn type_resource(&mut self, rep: ValType, dtor: Option<u32>) -> u32 {
         self.types().resource(rep, dtor);
         inc(&mut self.types)
@@ -381,6 +381,106 @@ impl ComponentBuilder {
     /// Declares a new `thread.hw_concurrency` intrinsic.
     pub fn thread_hw_concurrency(&mut self) -> u32 {
         self.canonical_functions().thread_hw_concurrency();
+        inc(&mut self.core_funcs)
+    }
+
+    /// TODO: docs
+    pub fn async_start(&mut self, ty: u32) -> u32 {
+        self.canonical_functions().async_start(ty);
+        inc(&mut self.core_funcs)
+    }
+
+    /// TODO: docs
+    pub fn async_return(&mut self, ty: u32) -> u32 {
+        self.canonical_functions().async_return(ty);
+        inc(&mut self.core_funcs)
+    }
+
+    /// TODO: docs
+    pub fn future_new(&mut self, ty: u32, memory: u32) -> u32 {
+        self.canonical_functions().future_new(ty, memory);
+        inc(&mut self.core_funcs)
+    }
+
+    /// TODO: docs
+    pub fn future_send<O>(&mut self, ty: u32, options: O) -> u32
+    where
+        O: IntoIterator<Item = CanonicalOption>,
+        O::IntoIter: ExactSizeIterator,
+    {
+        self.canonical_functions().future_send(ty, options);
+        inc(&mut self.core_funcs)
+    }
+
+    /// TODO: docs
+    pub fn future_receive<O>(&mut self, ty: u32, options: O) -> u32
+    where
+        O: IntoIterator<Item = CanonicalOption>,
+        O::IntoIter: ExactSizeIterator,
+    {
+        self.canonical_functions().future_receive(ty, options);
+        inc(&mut self.core_funcs)
+    }
+
+    /// TODO: docs
+    pub fn future_drop_sender(&mut self, ty: u32) -> u32 {
+        self.canonical_functions().future_drop_sender(ty);
+        inc(&mut self.core_funcs)
+    }
+
+    /// TODO: docs
+    pub fn future_drop_receiver(&mut self, ty: u32) -> u32 {
+        self.canonical_functions().future_drop_receiver(ty);
+        inc(&mut self.core_funcs)
+    }
+
+    /// TODO: docs
+    pub fn stream_new(&mut self, ty: u32, memory: u32) -> u32 {
+        self.canonical_functions().stream_new(ty, memory);
+        inc(&mut self.core_funcs)
+    }
+
+    /// TODO: docs
+    pub fn stream_send<O>(&mut self, ty: u32, options: O) -> u32
+    where
+        O: IntoIterator<Item = CanonicalOption>,
+        O::IntoIter: ExactSizeIterator,
+    {
+        self.canonical_functions().stream_send(ty, options);
+        inc(&mut self.core_funcs)
+    }
+
+    /// TODO: docs
+    pub fn stream_receive<O>(&mut self, ty: u32, options: O) -> u32
+    where
+        O: IntoIterator<Item = CanonicalOption>,
+        O::IntoIter: ExactSizeIterator,
+    {
+        self.canonical_functions().stream_receive(ty, options);
+        inc(&mut self.core_funcs)
+    }
+
+    /// TODO: docs
+    pub fn stream_drop_sender(&mut self, ty: u32) -> u32 {
+        self.canonical_functions().stream_drop_sender(ty);
+        inc(&mut self.core_funcs)
+    }
+
+    /// TODO: docs
+    pub fn stream_drop_receiver(&mut self, ty: u32) -> u32 {
+        self.canonical_functions().stream_drop_receiver(ty);
+        inc(&mut self.core_funcs)
+    }
+
+    /// TODO: docs
+    pub fn error_drop(&mut self) -> u32 {
+        self.canonical_functions().error_drop();
+        inc(&mut self.core_funcs)
+    }
+
+    /// TODO: docs
+    pub fn task_wait(&mut self, memory: u32) -> u32 {
+        self.canonical_functions().task_wait(memory);
         inc(&mut self.core_funcs)
     }
 

@@ -66,7 +66,7 @@ version = "0.218.0"
 rust-version = "1.76.0"
 
 [workspace.dependencies]
-anyhow = "1.0.58"
+anyhow = { version = "1.0.58", features = ["backtrace"] }
 arbitrary = "1.1.0"
 clap = { version = "4.0.0", features = ["derive"] }
 clap_complete = "4.4.7"
