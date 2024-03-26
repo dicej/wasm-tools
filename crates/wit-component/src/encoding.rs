@@ -74,12 +74,13 @@
 use crate::encoding::world::WorldAdapter;
 use crate::metadata::{self, Bindgen, ModuleMetadata};
 use crate::validation::{
-    ResourceInfo, ValidatedModule, BARE_FUNC_MODULE_NAME, MAIN_MODULE_IMPORT_NAME,
+    AsyncExportInfo, ResourceInfo, ValidatedModule, BARE_FUNC_MODULE_NAME, MAIN_MODULE_IMPORT_NAME,
     POST_RETURN_PREFIX,
 };
 use crate::StringEncoding;
 use anyhow::{anyhow, bail, Context, Result};
 use indexmap::{IndexMap, IndexSet};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::Hash;
 use wasm_encoder::*;
@@ -126,12 +127,13 @@ bitflags::bitflags! {
         /// A string encoding must be specified, which is always utf-8 for now
         /// today.
         const STRING_ENCODING = 1 << 2;
+        const ASYNC = 1 << 3;
     }
 }
 
 impl RequiredOptions {
-    fn for_import(resolve: &Resolve, func: &Function) -> RequiredOptions {
-        let sig = resolve.wasm_signature(AbiVariant::GuestImport, func);
+    fn for_import(resolve: &Resolve, func: &Function, abi: AbiVariant) -> RequiredOptions {
+        let sig = resolve.wasm_signature(abi, func);
         let mut ret = RequiredOptions::empty();
         // Lift the params and lower the results for imports
         ret.add_lift(TypeContents::for_types(
@@ -145,11 +147,14 @@ impl RequiredOptions {
         if sig.retptr || sig.indirect_params {
             ret |= RequiredOptions::MEMORY;
         }
+        if abi == AbiVariant::GuestImportAsync {
+            ret |= RequiredOptions::ASYNC;
+        }
         ret
     }
 
-    fn for_export(resolve: &Resolve, func: &Function) -> RequiredOptions {
-        let sig = resolve.wasm_signature(AbiVariant::GuestExport, func);
+    fn for_export(resolve: &Resolve, func: &Function, abi: AbiVariant) -> RequiredOptions {
+        let sig = resolve.wasm_signature(abi, func);
         let mut ret = RequiredOptions::empty();
         // Lower the params and lift the results for exports
         ret.add_lower(TypeContents::for_types(
@@ -166,6 +171,9 @@ impl RequiredOptions {
             if sig.indirect_params {
                 ret |= RequiredOptions::REALLOC;
             }
+        }
+        if abi == AbiVariant::GuestExportAsync {
+            ret |= RequiredOptions::ASYNC;
         }
         ret
     }
@@ -204,7 +212,7 @@ impl RequiredOptions {
     ) -> Result<impl ExactSizeIterator<Item = CanonicalOption>> {
         #[derive(Default)]
         struct Iter {
-            options: [Option<CanonicalOption>; 3],
+            options: [Option<CanonicalOption>; 4],
             current: usize,
             count: usize,
         }
@@ -252,6 +260,10 @@ impl RequiredOptions {
 
         if self.contains(RequiredOptions::STRING_ENCODING) {
             iter.push(encoding.into());
+        }
+
+        if self.contains(RequiredOptions::ASYNC) {
+            iter.push(CanonicalOption::Async);
         }
 
         Ok(iter)
@@ -485,7 +497,11 @@ impl<'a> EncodingState<'a> {
         // Next encode all required functions from this imported interface
         // into the instance type.
         for (_, func) in interface.functions.iter() {
-            if !info.lowerings.contains_key(&func.name) {
+            if !(info.lowerings.contains_key(&func.name)
+                || info
+                    .lowerings
+                    .contains_key(&format!("[async]{}", func.name)))
+            {
                 continue;
             }
             log::trace!("encoding function type for `{}`", func.name);
@@ -597,6 +613,8 @@ impl<'a> EncodingState<'a> {
             &mut args,
         );
 
+        self.add_async_funcs(&info.required_async_funcs, &mut args);
+
         // Instantiate the main module now that all of its arguments have been
         // prepared. With this we now have the main linear memory for
         // liftings/lowerings later on as well as the adapter modules, if any,
@@ -664,48 +682,62 @@ impl<'a> EncodingState<'a> {
         let mut exports = Vec::with_capacity(import.lowerings.len());
 
         for (index, (name, lowering)) in import.lowerings.iter().enumerate() {
-            if !required_imports.funcs.contains(name.as_str()) {
-                continue;
-            }
-            let index = match lowering {
-                // All direct lowerings can be `canon lower`'d here immediately
-                // and passed as arguments.
-                Lowering::Direct => {
-                    let func_index = match &import.interface {
-                        Some(interface) => {
-                            let instance_index = self.imported_instances[interface];
-                            self.component.alias_export(
-                                instance_index,
-                                name,
-                                ComponentExportKind::Func,
-                            )
-                        }
-                        None => self.imported_funcs[name],
-                    };
-                    self.component.lower_func(func_index, [])
+            let index = {
+                if !required_imports.funcs.contains(name) {
+                    continue;
                 }
+                let (async_, name) = if let Some(name) = name.strip_prefix("[async]") {
+                    (true, name)
+                } else {
+                    (false, name.as_str())
+                };
+                match lowering {
+                    // All direct lowerings can be `canon lower`'d here immediately
+                    // and passed as arguments.
+                    Lowering::Direct => {
+                        let func_index = match &import.interface {
+                            Some(interface) => {
+                                let instance_index = self.imported_instances[interface];
+                                self.component.alias_export(
+                                    instance_index,
+                                    name,
+                                    ComponentExportKind::Func,
+                                )
+                            }
+                            None => self.imported_funcs[name],
+                        };
+                        self.component.lower_func(
+                            func_index,
+                            if async_ {
+                                vec![CanonicalOption::Async]
+                            } else {
+                                Vec::new()
+                            },
+                        )
+                    }
 
-                // Add an entry for all indirect lowerings which come as an
-                // export of the shim module.
-                Lowering::Indirect { .. } => {
-                    let encoding =
-                        metadata.import_encodings[&(core_wasm_name.to_string(), name.clone())];
-                    self.component.core_alias_export(
-                        self.shim_instance_index
-                            .expect("shim should be instantiated"),
-                        &shims.shim_names[&ShimKind::IndirectLowering {
-                            interface: interface.clone(),
-                            index,
-                            realloc: for_module,
-                            encoding,
-                        }],
-                        ExportKind::Func,
-                    )
-                }
+                    // Add an entry for all indirect lowerings which come as an
+                    // export of the shim module.
+                    Lowering::Indirect { .. } => {
+                        let encoding = metadata.import_encodings
+                            [&(core_wasm_name.to_string(), name.to_string())];
+                        self.component.core_alias_export(
+                            self.shim_instance_index
+                                .expect("shim should be instantiated"),
+                            &shims.shim_names[&ShimKind::IndirectLowering {
+                                interface: interface.clone(),
+                                index,
+                                realloc: for_module,
+                                encoding,
+                            }],
+                            ExportKind::Func,
+                        )
+                    }
 
-                Lowering::ResourceDrop(id) => {
-                    let resource_idx = self.lookup_resource_index(*id);
-                    self.component.resource_drop(resource_idx)
+                    Lowering::ResourceDrop(id) => {
+                        let resource_idx = self.lookup_resource_index(*id);
+                        self.component.resource_drop(resource_idx)
+                    }
                 }
             };
             exports.push((name.as_str(), ExportKind::Func, index));
@@ -738,6 +770,12 @@ impl<'a> EncodingState<'a> {
             CustomModule::Main => &self.info.encoder.main_module_exports,
             CustomModule::Adapter(name) => &self.info.encoder.adapters[name].required_exports,
         };
+        let async_map = match module {
+            CustomModule::Main => &self.info.info.required_async_funcs,
+            CustomModule::Adapter(name) => &self.info.adapters[name].info.required_async_funcs,
+        }
+        .get(&format!("[export]{BARE_FUNC_MODULE_NAME}"));
+
         let world = &resolve.worlds[self.info.encoder.metadata.world];
         for export_name in exports {
             let export_string = resolve.name_world_key(export_name);
@@ -746,8 +784,11 @@ impl<'a> EncodingState<'a> {
                     let ty = self
                         .root_import_type_encoder(None)
                         .encode_func_type(resolve, func)?;
+                    let async_ = async_map
+                        .map(|m| m.get(&func.name).is_some())
+                        .unwrap_or(false);
                     let core_name = func.core_export_name(None);
-                    let idx = self.encode_lift(module, &core_name, func, ty)?;
+                    let idx = self.encode_lift(module, &core_name, func, ty, async_)?;
                     self.component
                         .export(&export_string, ComponentExportKind::Func, idx, None);
                 }
@@ -770,6 +811,12 @@ impl<'a> EncodingState<'a> {
         log::trace!("encode interface export `{export_name}`");
         let resolve = &self.info.encoder.metadata.resolve;
 
+        let async_map = match module {
+            CustomModule::Main => &self.info.info.required_async_funcs,
+            CustomModule::Adapter(name) => &self.info.adapters[name].info.required_async_funcs,
+        }
+        .get(&format!("[export]{export_name}"));
+
         // First execute a `canon lift` for all the functions in this interface
         // from the core wasm export. This requires type information but notably
         // not exported type information since we don't want to export this
@@ -779,9 +826,14 @@ impl<'a> EncodingState<'a> {
         let mut imports = Vec::new();
         let mut root = self.root_export_type_encoder(Some(export));
         for (_, func) in &resolve.interfaces[export].functions {
+            let async_ = async_map
+                .map(|m| m.get(&func.name).is_some())
+                .unwrap_or(false);
             let core_name = func.core_export_name(Some(export_name));
             let ty = root.encode_func_type(resolve, func)?;
-            let func_index = root.state.encode_lift(module, &core_name, func, ty)?;
+            let func_index = root
+                .state
+                .encode_lift(module, &core_name, func, ty, async_)?;
             imports.push((
                 import_func_name(func),
                 ComponentExportKind::Func,
@@ -1076,6 +1128,7 @@ impl<'a> EncodingState<'a> {
         core_name: &str,
         func: &Function,
         ty: u32,
+        async_: bool,
     ) -> Result<u32> {
         let resolve = &self.info.encoder.metadata.resolve;
         let metadata = match module {
@@ -1090,11 +1143,24 @@ impl<'a> EncodingState<'a> {
             CustomModule::Main => self.instance_index.expect("instantiated by now"),
             CustomModule::Adapter(name) => self.adapter_instances[name],
         };
+        let lift_name = if async_ {
+            Cow::Owned(format!("[async]{core_name}"))
+        } else {
+            Cow::Borrowed(core_name)
+        };
         let core_func_index =
             self.component
-                .core_alias_export(instance_index, core_name, ExportKind::Func);
+                .core_alias_export(instance_index, &lift_name, ExportKind::Func);
 
-        let options = RequiredOptions::for_export(resolve, func);
+        let options = RequiredOptions::for_export(
+            resolve,
+            func,
+            if async_ {
+                AbiVariant::GuestExportAsync
+            } else {
+                AbiVariant::GuestExport
+            },
+        );
 
         let encoding = metadata.export_encodings[core_name];
         // TODO: This realloc detection should probably be improved with
@@ -1374,6 +1440,7 @@ impl<'a> EncodingState<'a> {
                 } => {
                     let interface = &self.info.import_map[interface];
                     let (name, _) = interface.lowerings.get_index(*index).unwrap();
+                    let name = name.strip_prefix("[async]").unwrap_or(name);
                     let func_index = match &interface.interface {
                         Some(interface_id) => {
                             let instance_index = self.imported_instances[interface_id];
@@ -1561,6 +1628,50 @@ impl<'a> EncodingState<'a> {
         }
     }
 
+    fn add_async_funcs<'b>(
+        &mut self,
+        funcs: &'b IndexMap<String, IndexMap<String, AsyncExportInfo>>,
+        args: &mut Vec<(&'b str, ModuleArg)>,
+    ) {
+        for (import, info) in funcs {
+            let mut exports = Vec::new();
+            for info in info.values() {
+                let convert = |ty: &_| match ty {
+                    wasmparser::ValType::I32 => wasm_encoder::ValType::I32,
+                    wasmparser::ValType::I64 => wasm_encoder::ValType::I64,
+                    wasmparser::ValType::F32 => wasm_encoder::ValType::F32,
+                    wasmparser::ValType::F64 => wasm_encoder::ValType::F64,
+                    wasmparser::ValType::V128 => wasm_encoder::ValType::V128,
+                    wasmparser::ValType::Ref(_) => unreachable!(),
+                };
+
+                let add_type = |ty: &wasmparser::FuncType, component: &mut ComponentBuilder| {
+                    let (type_index, type_encoder) = component.core_type();
+                    type_encoder.function(
+                        ty.params().iter().map(convert),
+                        ty.results().iter().map(convert),
+                    );
+                    type_index
+                };
+
+                if let Some((name, ty)) = info.start_import.as_ref() {
+                    let type_index = add_type(ty, &mut self.component);
+                    let index = self.component.async_start(type_index);
+                    exports.push((name.as_str(), ExportKind::Func, index));
+                }
+                if let Some((name, ty)) = info.return_import.as_ref() {
+                    let type_index = add_type(ty, &mut self.component);
+                    let index = self.component.async_return(type_index);
+                    exports.push((name.as_str(), ExportKind::Func, index));
+                }
+            }
+            if !exports.is_empty() {
+                let index = self.component.core_instantiate_exports(exports);
+                args.push((import.as_str(), ModuleArg::Instance(index)));
+            }
+        }
+    }
+
     /// This function will instantiate the specified adapter module, which may
     /// depend on previously-instantiated modules.
     fn instantiate_adapter_module(
@@ -1670,6 +1781,8 @@ impl<'a> EncodingState<'a> {
             shims,
             &mut args,
         );
+
+        self.add_async_funcs(&adapter.info.required_async_funcs, &mut args);
 
         let instance = self
             .component
@@ -1808,6 +1921,7 @@ impl<'a> Shims<'a> {
             if !required.contains(name.as_str()) {
                 continue;
             }
+            let name = name.strip_prefix("[async]").unwrap_or(name);
             let shim_name = self.list.len().to_string();
             log::debug!(
                 "shim {shim_name} is import `{core_wasm_module}` lowering {index} `{name}`",
@@ -1819,7 +1933,7 @@ impl<'a> Shims<'a> {
                     sigs.push(sig.clone());
                     let encoding = *metadata
                         .import_encodings
-                        .get(&(core_wasm_module.to_string(), name.clone()))
+                        .get(&(core_wasm_module.to_string(), name.to_string()))
                         .ok_or_else(|| {
                             anyhow::anyhow!(
                                 "missing component metadata for import of \

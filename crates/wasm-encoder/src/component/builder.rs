@@ -316,7 +316,7 @@ impl ComponentBuilder {
         (inc(&mut self.types), self.types().function())
     }
 
-    /// Declares a
+    /// Declares a new resource type within this component.
     pub fn type_resource(&mut self, rep: ValType, dtor: Option<u32>) -> u32 {
         self.types().resource(rep, dtor);
         inc(&mut self.types)
@@ -369,6 +369,18 @@ impl ComponentBuilder {
     /// Declares a new `resource.rep` intrinsic.
     pub fn resource_rep(&mut self, ty: u32) -> u32 {
         self.canonical_functions().resource_rep(ty);
+        inc(&mut self.core_funcs)
+    }
+
+    /// TODO: docs
+    pub fn async_start(&mut self, type_index: u32) -> u32 {
+        self.canonical_functions().async_start(type_index);
+        inc(&mut self.core_funcs)
+    }
+
+    /// TODO: docs
+    pub fn async_return(&mut self, type_index: u32) -> u32 {
+        self.canonical_functions().async_return(type_index);
         inc(&mut self.core_funcs)
     }
 

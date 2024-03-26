@@ -22,6 +22,8 @@ pub enum CanonicalOption {
     /// The post-return function to use if the lifting of a function requires
     /// cleanup after the function returns.
     PostReturn(u32),
+    /// TODO: docs
+    Async,
 }
 
 /// Represents a canonical function in a WebAssembly component.
@@ -58,6 +60,16 @@ pub enum CanonicalFunction {
     ResourceRep {
         /// The type index of the resource that's being accessed.
         resource: u32,
+    },
+    /// TODO: docs
+    AsyncStart {
+        /// TODO: docs
+        type_index: u32,
+    },
+    /// TODO: docs
+    AsyncReturn {
+        /// TODO: docs
+        type_index: u32,
     },
 }
 
@@ -100,6 +112,12 @@ impl<'a> FromReader<'a> for CanonicalFunction {
             0x04 => CanonicalFunction::ResourceRep {
                 resource: reader.read()?,
             },
+            0x05 => CanonicalFunction::AsyncStart {
+                type_index: reader.read()?,
+            },
+            0x06 => CanonicalFunction::AsyncReturn {
+                type_index: reader.read()?,
+            },
             x => return reader.invalid_leading_byte(x, "canonical function"),
         })
     }
@@ -114,6 +132,7 @@ impl<'a> FromReader<'a> for CanonicalOption {
             0x03 => CanonicalOption::Memory(reader.read_var_u32()?),
             0x04 => CanonicalOption::Realloc(reader.read_var_u32()?),
             0x05 => CanonicalOption::PostReturn(reader.read_var_u32()?),
+            0x06 => CanonicalOption::Async,
             x => return reader.invalid_leading_byte(x, "canonical option"),
         })
     }

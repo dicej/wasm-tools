@@ -102,6 +102,11 @@ fn main() -> ExitCode {
 }
 
 fn print_error(color: ColorChoice, err: anyhow::Error) -> Result<()> {
+    if true {
+        eprintln!("{err:?}");
+        return Ok(());
+    }
+
     let color = if color == ColorChoice::Auto && !io::stderr().is_terminal() {
         ColorChoice::Never
     } else {

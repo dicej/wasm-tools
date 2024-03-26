@@ -1208,6 +1208,12 @@ impl Validator {
                     crate::CanonicalFunction::ResourceRep { resource } => {
                         current.resource_rep(resource, types, offset)
                     }
+                    crate::CanonicalFunction::AsyncStart { type_index } => {
+                        current.async_start(type_index, types, offset)
+                    }
+                    crate::CanonicalFunction::AsyncReturn { type_index } => {
+                        current.async_return(type_index, types, offset)
+                    }
                 }
             },
         )

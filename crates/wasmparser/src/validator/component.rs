@@ -961,7 +961,7 @@ impl ComponentState {
 
         // Lifting a function is for an export, so match the expected canonical ABI
         // export signature
-        let info = ty.lower(types, false);
+        let info = ty.lower(types, false, options.contains(&CanonicalOption::Async));
         self.check_options(Some(core_ty), &info, &options, types, offset)?;
 
         if core_ty.params() != info.params.as_slice() {
@@ -1001,7 +1001,7 @@ impl ComponentState {
 
         // Lowering a function is for an import, so use a function type that matches
         // the expected canonical ABI import signature.
-        let info = ty.lower(types, true);
+        let info = ty.lower(types, true, options.contains(&CanonicalOption::Async));
 
         self.check_options(None, &info, &options, types, offset)?;
 
@@ -1071,6 +1071,36 @@ impl ComponentState {
         };
         let (_is_new, group_id) =
             types.intern_canonical_rec_group(RecGroup::implicit(offset, core_ty));
+        let id = types[group_id].start;
+        self.core_funcs.push(id);
+        Ok(())
+    }
+
+    pub fn async_start(
+        &mut self,
+        type_index: u32,
+        types: &mut TypeAlloc,
+        offset: usize,
+    ) -> Result<()> {
+        let ty = self
+            .core_function_type_at(type_index, types, offset)?
+            .clone();
+        let (_is_new, group_id) = types.intern_canonical_rec_group(RecGroup::implicit(offset, ty));
+        let id = types[group_id].start;
+        self.core_funcs.push(id);
+        Ok(())
+    }
+
+    pub fn async_return(
+        &mut self,
+        type_index: u32,
+        types: &mut TypeAlloc,
+        offset: usize,
+    ) -> Result<()> {
+        let ty = self
+            .core_function_type_at(type_index, types, offset)?
+            .clone();
+        let (_is_new, group_id) = types.intern_canonical_rec_group(RecGroup::implicit(offset, ty));
         let id = types[group_id].start;
         self.core_funcs.push(id);
         Ok(())
@@ -1258,6 +1288,7 @@ impl ComponentState {
                 CanonicalOption::Memory(_) => "memory",
                 CanonicalOption::Realloc(_) => "realloc",
                 CanonicalOption::PostReturn(_) => "post-return",
+                CanonicalOption::Async => "async",
             }
         }
 
@@ -1346,6 +1377,8 @@ impl ComponentState {
                         }
                     }
                 }
+                // TODO
+                CanonicalOption::Async => {}
             }
         }
 
@@ -1777,7 +1810,7 @@ impl ComponentState {
             cx.entity_type(arg, expected, offset).with_context(|| {
                 format!(
                     "type mismatch for export `{name}` of module \
-                         instantiation argument `{module}`"
+                     instantiation argument `{module}`"
                 )
             })?;
         }
@@ -2752,6 +2785,19 @@ impl ComponentState {
             .get(idx as usize)
             .copied()
             .ok_or_else(|| format_err!(offset, "unknown type {idx}: type index out of bounds"))
+    }
+
+    fn core_function_type_at<'a>(
+        &self,
+        idx: u32,
+        types: &'a TypeList,
+        offset: usize,
+    ) -> Result<&'a SubType> {
+        let id = self.core_type_at(idx, offset)?;
+        match id {
+            ComponentCoreTypeId::Sub(id) => Ok(&types[id]),
+            _ => bail!(offset, "type index {idx} is not a function type"),
+        }
     }
 
     pub fn component_type_at(&self, idx: u32, offset: usize) -> Result<ComponentAnyTypeId> {

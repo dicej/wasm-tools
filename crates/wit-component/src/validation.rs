@@ -48,6 +48,9 @@ pub const RESOURCE_DROP: &str = "[resource-drop]";
 pub const RESOURCE_REP: &str = "[resource-rep]";
 pub const RESOURCE_NEW: &str = "[resource-new]";
 
+pub const ASYNC_START: &str = "[async-start]";
+pub const ASYNC_RETURN: &str = "[async-return]";
+
 pub const POST_RETURN_PREFIX: &str = "cabi_post_";
 
 /// Metadata about a validated module and what was found internally.
@@ -85,6 +88,8 @@ pub struct ValidatedModule<'a> {
     /// itself.
     pub required_resource_funcs: IndexMap<String, IndexMap<String, ResourceInfo>>,
 
+    pub required_async_funcs: IndexMap<String, IndexMap<String, AsyncExportInfo>>,
+
     /// Whether or not this module exported a linear memory.
     pub has_memory: bool,
 
@@ -116,6 +121,11 @@ pub struct ResourceInfo {
     pub id: TypeId,
 }
 
+pub struct AsyncExportInfo {
+    pub start_import: Option<(String, FuncType)>,
+    pub return_import: Option<(String, FuncType)>,
+}
+
 /// This function validates the following:
 ///
 /// * The `bytes` represent a valid core WebAssembly module.
@@ -144,6 +154,7 @@ pub fn validate_module<'a>(
         realloc: None,
         adapter_realloc: None,
         metadata: &metadata.metadata,
+        required_async_funcs: Default::default(),
         required_resource_funcs: Default::default(),
         post_returns: Default::default(),
     };
@@ -211,7 +222,7 @@ pub fn validate_module<'a>(
 
     let types = types.unwrap();
     let world = &metadata.resolve.worlds[metadata.world];
-    let mut exported_resource_funcs = Vec::new();
+    let mut exported_resource_and_async_funcs = Vec::new();
 
     for (name, funcs) in &import_funcs {
         // An empty module name is indicative of the top-level import namespace,
@@ -225,7 +236,7 @@ pub fn validate_module<'a>(
         }
 
         if let Some(interface_name) = name.strip_prefix("[export]") {
-            exported_resource_funcs.push((name, interface_name, &import_funcs[name]));
+            exported_resource_and_async_funcs.push((name, interface_name, &import_funcs[name]));
             continue;
         }
 
@@ -265,20 +276,22 @@ pub fn validate_module<'a>(
             &export_funcs,
             &types,
             &mut ret.post_returns,
+            &mut ret.required_async_funcs,
             &mut ret.required_resource_funcs,
         )?;
     }
 
-    for (name, interface_name, funcs) in exported_resource_funcs {
+    for (name, interface_name, funcs) in exported_resource_and_async_funcs {
         let world_key = world_key(&metadata.resolve, interface_name);
         match world.exports.get(&world_key) {
             Some(WorldItem::Interface(i)) => {
-                validate_exported_interface_resource_imports(
+                validate_exported_interface_resource_and_async_imports(
                     &metadata.resolve,
                     *i,
                     name,
                     funcs,
                     &types,
+                    &mut ret.required_async_funcs,
                     &mut ret.required_resource_funcs,
                 )?;
             }
@@ -289,12 +302,13 @@ pub fn validate_module<'a>(
     Ok(ret)
 }
 
-fn validate_exported_interface_resource_imports<'a>(
+fn validate_exported_interface_resource_and_async_imports<'a>(
     resolve: &Resolve,
     interface: InterfaceId,
     import_module: &str,
     funcs: &IndexMap<&'a str, u32>,
     types: &Types,
+    required_async_funcs: &mut IndexMap<String, IndexMap<String, AsyncExportInfo>>,
     required_resource_funcs: &mut IndexMap<String, IndexMap<String, ResourceInfo>>,
 ) -> Result<()> {
     let is_resource = |name: &str| match resolve.interfaces[interface].types.get(name) {
@@ -302,8 +316,24 @@ fn validate_exported_interface_resource_imports<'a>(
         None => false,
     };
     for (func_name, ty) in funcs {
+        if let Some(info) = required_async_funcs.get_mut(import_module) {
+            let func_type = |ty| {
+                types[types.core_type_at(ty).unwrap_sub()]
+                    .unwrap_func()
+                    .clone()
+            };
+            if let Some(function_name) = func_name.strip_prefix(ASYNC_START) {
+                info[function_name].start_import = Some((func_name.to_string(), func_type(*ty)));
+                continue;
+            }
+            if let Some(function_name) = func_name.strip_prefix(ASYNC_RETURN) {
+                info[function_name].return_import = Some((func_name.to_string(), func_type(*ty)));
+                continue;
+            }
+        }
+
         if valid_exported_resource_func(func_name, *ty, types, is_resource)?.is_none() {
-            bail!("import of `{func_name}` is not a valid resource function");
+            bail!("import of `{func_name}` is not a valid resource or async function");
         }
         let info = required_resource_funcs.get_mut(import_module).unwrap();
         if let Some(resource_name) = func_name.strip_prefix(RESOURCE_DROP) {
@@ -342,6 +372,8 @@ pub struct ValidatedAdapter<'a> {
     /// resources still require intrinsics to be imported into the core module
     /// itself.
     pub required_resource_funcs: IndexMap<String, IndexMap<String, ResourceInfo>>,
+
+    pub required_async_funcs: IndexMap<String, IndexMap<String, AsyncExportInfo>>,
 
     /// This is the module and field name of the memory import, if one is
     /// specified.
@@ -405,6 +437,7 @@ pub fn validate_adapter_module<'a>(
     let mut ret = ValidatedAdapter {
         required_imports: Default::default(),
         required_resource_funcs: Default::default(),
+        required_async_funcs: Default::default(),
         needs_memory: None,
         needs_core_exports: Default::default(),
         import_realloc: None,
@@ -569,6 +602,7 @@ pub fn validate_adapter_module<'a>(
             &export_funcs,
             &types,
             &mut ret.post_returns,
+            &mut ret.required_async_funcs,
             &mut ret.required_resource_funcs,
         )?;
     }
@@ -577,12 +611,13 @@ pub fn validate_adapter_module<'a>(
         let world_key = world_key(resolve, interface_name);
         match world.exports.get(&world_key) {
             Some(WorldItem::Interface(i)) => {
-                validate_exported_interface_resource_imports(
+                validate_exported_interface_resource_and_async_imports(
                     resolve,
                     *i,
                     name,
                     funcs,
                     &types,
+                    &mut ret.required_async_funcs,
                     &mut ret.required_resource_funcs,
                 )?;
             }
@@ -633,18 +668,25 @@ fn validate_imports_top_level(
     };
     let mut required = RequiredImports::default();
     for (name, ty) in funcs {
-        match resolve.worlds[world].imports.get(&world_key(resolve, name)) {
-            Some(WorldItem::Function(func)) => {
-                let ty = types[types.core_type_at(*ty).unwrap_sub()].unwrap_func();
-                validate_func(resolve, ty, func, AbiVariant::GuestImport)?;
-            }
-            Some(_) => bail!("expected world top-level import `{name}` to be a function"),
-            None => match valid_imported_resource_func(name, *ty, types, is_resource)? {
-                Some(name) => {
-                    required.resources.insert(name.to_string());
+        {
+            let (abi, name) = if let Some(name) = name.strip_prefix("[async]") {
+                (AbiVariant::GuestImportAsync, name)
+            } else {
+                (AbiVariant::GuestImport, *name)
+            };
+            match resolve.worlds[world].imports.get(&world_key(resolve, name)) {
+                Some(WorldItem::Function(func)) => {
+                    let ty = types[types.core_type_at(*ty).unwrap_sub()].unwrap_func();
+                    validate_func(resolve, ty, func, abi)?;
                 }
-                None => bail!("no top-level imported function `{name}` specified"),
-            },
+                Some(_) => bail!("expected world top-level import `{name}` to be a function"),
+                None => match valid_imported_resource_func(name, *ty, types, is_resource)? {
+                    Some(name) => {
+                        required.resources.insert(name.to_string());
+                    }
+                    None => bail!("no top-level imported function `{name}` specified"),
+                },
+            }
         }
         required.funcs.insert(name.to_string());
     }
@@ -707,20 +749,27 @@ fn validate_imported_interface(
         matches!(resolve.types[ty].kind, TypeDefKind::Resource)
     };
     for (func_name, ty) in imports {
-        match resolve.interfaces[interface].functions.get(*func_name) {
-            Some(f) => {
-                let ty = types[types.core_type_at(*ty).unwrap_sub()].unwrap_func();
-                validate_func(resolve, ty, f, AbiVariant::GuestImport)?;
-            }
-            None => match valid_imported_resource_func(func_name, *ty, types, is_resource)? {
-                Some(name) => {
-                    required.resources.insert(name.to_string());
+        {
+            let (abi, func_name) = if let Some(name) = func_name.strip_prefix("[async]") {
+                (AbiVariant::GuestImportAsync, name)
+            } else {
+                (AbiVariant::GuestImport, *func_name)
+            };
+            match resolve.interfaces[interface].functions.get(func_name) {
+                Some(f) => {
+                    let ty = types[types.core_type_at(*ty).unwrap_sub()].unwrap_func();
+                    validate_func(resolve, ty, f, abi)?;
                 }
-                None => bail!(
-                    "import interface `{name}` is missing function \
-                         `{func_name}` that is required by the module",
-                ),
-            },
+                None => match valid_imported_resource_func(func_name, *ty, types, is_resource)? {
+                    Some(name) => {
+                        required.resources.insert(name.to_string());
+                    }
+                    None => bail!(
+                        "import interface `{name}` is missing function \
+                     `{func_name}` that is required by the module",
+                    ),
+                },
+            }
         }
         required.funcs.insert(func_name.to_string());
     }
@@ -782,40 +831,66 @@ fn validate_exported_item<'a>(
     exports: &IndexMap<&str, u32>,
     types: &Types,
     post_returns: &mut IndexSet<String>,
+    required_async_funcs: &mut IndexMap<String, IndexMap<String, AsyncExportInfo>>,
     required_resource_funcs: &mut IndexMap<String, IndexMap<String, ResourceInfo>>,
 ) -> Result<()> {
-    let mut validate = |func: &Function, name: Option<&str>| {
-        let expected_export_name = func.core_export_name(name);
-        let func_index = match exports.get(expected_export_name.as_ref()) {
-            Some(func_index) => func_index,
-            None => bail!(
-                "module does not export required function `{}`",
-                expected_export_name
-            ),
-        };
-        let id = types.core_function_at(*func_index);
-        let ty = types[id].unwrap_func();
-        validate_func(resolve, ty, func, AbiVariant::GuestExport)?;
+    let mut validate =
+        |func: &Function, name: Option<&str>, async_map: &mut IndexMap<String, AsyncExportInfo>| {
+            let expected_export_name = func.core_export_name(name);
+            let (abi, func_index) = match exports.get(expected_export_name.as_ref()) {
+                Some(func_index) => (AbiVariant::GuestExport, func_index),
+                None => match exports.get(format!("[async]{expected_export_name}").as_str()) {
+                    Some(func_index) => {
+                        async_map.insert(
+                            func.name.clone(),
+                            AsyncExportInfo {
+                                start_import: None,
+                                return_import: None,
+                            },
+                        );
 
-        let post_return = format!("{POST_RETURN_PREFIX}{expected_export_name}");
-        if let Some(index) = exports.get(&post_return[..]) {
-            let ok = post_returns.insert(post_return);
-            assert!(ok);
-            let id = types.core_function_at(*index);
+                        (AbiVariant::GuestExportAsync, func_index)
+                    }
+                    None => bail!(
+                        "module does not export required function `{}`",
+                        expected_export_name
+                    ),
+                },
+            };
+            let id = types.core_function_at(*func_index);
             let ty = types[id].unwrap_func();
-            validate_post_return(resolve, ty, func)?;
-        }
-        Ok(())
-    };
+            validate_func(resolve, ty, func, abi)?;
+
+            let post_return = format!("{POST_RETURN_PREFIX}{expected_export_name}");
+            if let Some(index) = exports.get(&post_return[..]) {
+                let ok = post_returns.insert(post_return);
+                assert!(ok);
+                let id = types.core_function_at(*index);
+                let ty = types[id].unwrap_func();
+                validate_post_return(resolve, ty, func)?;
+            }
+
+            Ok(())
+        };
+
     match item {
-        WorldItem::Function(func) => validate(func, None)?,
+        WorldItem::Function(func) => validate(
+            func,
+            None,
+            required_async_funcs
+                .entry(format!("[export]{BARE_FUNC_MODULE_NAME}"))
+                .or_default(),
+        )?,
         WorldItem::Interface(interface) => {
             let interface = &resolve.interfaces[*interface];
+            let mut async_map = IndexMap::new();
             for (_, f) in interface.functions.iter() {
-                validate(f, Some(export_name)).with_context(|| {
+                validate(f, Some(export_name), &mut async_map).with_context(|| {
                     format!("failed to validate exported interface `{export_name}`")
                 })?;
             }
+            let prev = required_async_funcs.insert(format!("[export]{export_name}"), async_map);
+            assert!(prev.is_none());
             let mut map = IndexMap::new();
             for (name, id) in interface.types.iter() {
                 if !matches!(resolve.types[*id].kind, TypeDefKind::Resource) {

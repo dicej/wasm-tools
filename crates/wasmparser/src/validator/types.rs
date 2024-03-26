@@ -1168,8 +1168,22 @@ impl TypeData for ComponentFuncType {
 impl ComponentFuncType {
     /// Lowers the component function type to core parameter and result types for the
     /// canonical ABI.
-    pub(crate) fn lower(&self, types: &TypeList, is_lower: bool) -> LoweringInfo {
+    pub(crate) fn lower(&self, types: &TypeList, is_lower: bool, async_: bool) -> LoweringInfo {
         let mut info = LoweringInfo::default();
+
+        if async_ {
+            if is_lower {
+                for _ in 0..3 {
+                    info.params.push(ValType::I32);
+                }
+                info.results.push(ValType::I32);
+                info.requires_memory = true;
+                info.requires_realloc = self.results.iter().any(|(_, ty)| ty.contains_ptr(types));
+            } else {
+                info.results.push(ValType::I32);
+            }
+            return info;
+        }
 
         for (_, ty) in self.params.iter() {
             // Check to see if `ty` has a pointer somewhere in it, needed for

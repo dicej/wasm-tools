@@ -21,6 +21,8 @@ pub enum CanonicalOption {
     /// The post-return function to use if the lifting of a function requires
     /// cleanup after the function returns.
     PostReturn(u32),
+    /// TODO: docs
+    Async,
 }
 
 impl Encode for CanonicalOption {
@@ -40,6 +42,9 @@ impl Encode for CanonicalOption {
             Self::PostReturn(idx) => {
                 sink.push(0x05);
                 idx.encode(sink);
+            }
+            Self::Async => {
+                sink.push(0x06);
             }
         }
     }
@@ -141,6 +146,22 @@ impl CanonicalFunctionSection {
     pub fn resource_rep(&mut self, ty_index: u32) -> &mut Self {
         self.bytes.push(0x04);
         ty_index.encode(&mut self.bytes);
+        self.num_added += 1;
+        self
+    }
+
+    /// TODO: docs
+    pub fn async_start(&mut self, type_index: u32) -> &mut Self {
+        self.bytes.push(0x05);
+        type_index.encode(&mut self.bytes);
+        self.num_added += 1;
+        self
+    }
+
+    /// TODO: docs
+    pub fn async_return(&mut self, type_index: u32) -> &mut Self {
+        self.bytes.push(0x06);
+        type_index.encode(&mut self.bytes);
         self.num_added += 1;
         self
     }

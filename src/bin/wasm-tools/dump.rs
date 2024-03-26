@@ -411,7 +411,9 @@ impl<'a> Dump<'a> {
                             CanonicalFunction::Lower { .. }
                             | CanonicalFunction::ResourceNew { .. }
                             | CanonicalFunction::ResourceDrop { .. }
-                            | CanonicalFunction::ResourceRep { .. } => {
+                            | CanonicalFunction::ResourceRep { .. }
+                            | CanonicalFunction::AsyncStart { .. }
+                            | CanonicalFunction::AsyncReturn { .. } => {
                                 ("core func", &mut i.core_funcs)
                             }
                         };

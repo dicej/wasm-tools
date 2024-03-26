@@ -457,19 +457,26 @@ impl<'a> ComponentWorld<'a> {
 
 impl ImportedInterface {
     fn add_func(&mut self, required: &IndexSet<&str>, resolve: &Resolve, func: &Function) {
-        if !required.contains(func.name.as_str()) {
-            return;
-        }
+        let (name, abi) = if required.contains(func.name.as_str()) {
+            (func.name.clone(), AbiVariant::GuestImport)
+        } else {
+            let async_name = format!("[async]{}", func.name);
+            if required.contains(async_name.as_str()) {
+                (async_name, AbiVariant::GuestImportAsync)
+            } else {
+                return;
+            }
+        };
         log::trace!("add func {}", func.name);
-        let options = RequiredOptions::for_import(resolve, func);
+        let options = RequiredOptions::for_import(resolve, func, abi);
         let lowering = if options.is_empty() {
             Lowering::Direct
         } else {
-            let sig = resolve.wasm_signature(AbiVariant::GuestImport, func);
+            let sig = resolve.wasm_signature(abi, func);
             Lowering::Indirect { sig, options }
         };
 
-        let prev = self.lowerings.insert(func.name.clone(), lowering);
+        let prev = self.lowerings.insert(name, lowering);
         assert!(prev.is_none());
     }
 
