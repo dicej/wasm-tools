@@ -74,8 +74,8 @@
 use crate::encoding::world::WorldAdapter;
 use crate::metadata::{self, Bindgen, ModuleMetadata};
 use crate::validation::{
-    AsyncExportInfo, ResourceInfo, ValidatedModule, BARE_FUNC_MODULE_NAME, MAIN_MODULE_IMPORT_NAME,
-    POST_RETURN_PREFIX,
+    AsyncExportInfo, ResourceInfo, ValidatedModule, BARE_FUNC_MODULE_NAME, CALLBACK_PREFIX,
+    MAIN_MODULE_IMPORT_NAME, POST_RETURN_PREFIX,
 };
 use crate::StringEncoding;
 use anyhow::{anyhow, bail, Context, Result};
@@ -212,7 +212,7 @@ impl RequiredOptions {
     ) -> Result<impl ExactSizeIterator<Item = CanonicalOption>> {
         #[derive(Default)]
         struct Iter {
-            options: [Option<CanonicalOption>; 4],
+            options: [Option<CanonicalOption>; 5],
             current: usize,
             count: usize,
         }
@@ -1139,6 +1139,10 @@ impl<'a> EncodingState<'a> {
             CustomModule::Main => &self.info.info.post_returns,
             CustomModule::Adapter(name) => &self.info.adapters[name].info.post_returns,
         };
+        let callbacks = match module {
+            CustomModule::Main => &self.info.info.callbacks,
+            CustomModule::Adapter(name) => &self.info.adapters[name].info.callbacks,
+        };
         let instance_index = match module {
             CustomModule::Main => self.instance_index.expect("instantiated by now"),
             CustomModule::Adapter(name) => self.adapter_instances[name],
@@ -1173,6 +1177,14 @@ impl<'a> EncodingState<'a> {
         let mut options = options
             .into_iter(encoding, self.memory_index, realloc_index)?
             .collect::<Vec<_>>();
+
+        let callback = format!("{CALLBACK_PREFIX}{core_name}");
+        if callbacks.contains(&callback[..]) {
+            let callback =
+                self.component
+                    .core_alias_export(instance_index, &callback, ExportKind::Func);
+            options.push(CanonicalOption::Callback(callback));
+        }
 
         let post_return = format!("{POST_RETURN_PREFIX}{core_name}");
         if post_returns.contains(&post_return[..]) {
@@ -1630,38 +1642,24 @@ impl<'a> EncodingState<'a> {
 
     fn add_async_funcs<'b>(
         &mut self,
-        funcs: &'b IndexMap<String, IndexMap<String, AsyncExportInfo>>,
+        funcs: &'b IndexMap<String, IndexMap<String, AsyncExportInfo<'a>>>,
         args: &mut Vec<(&'b str, ModuleArg)>,
     ) {
+        let resolve = &self.info.encoder.metadata.resolve;
         for (import, info) in funcs {
             let mut exports = Vec::new();
             for info in info.values() {
-                let convert = |ty: &_| match ty {
-                    wasmparser::ValType::I32 => wasm_encoder::ValType::I32,
-                    wasmparser::ValType::I64 => wasm_encoder::ValType::I64,
-                    wasmparser::ValType::F32 => wasm_encoder::ValType::F32,
-                    wasmparser::ValType::F64 => wasm_encoder::ValType::F64,
-                    wasmparser::ValType::V128 => wasm_encoder::ValType::V128,
-                    wasmparser::ValType::Ref(_) => unreachable!(),
-                };
+                let component_type_index = self
+                    .root_import_type_encoder(info.interface)
+                    .encode_func_type(resolve, &info.function)
+                    .unwrap();
 
-                let add_type = |ty: &wasmparser::FuncType, component: &mut ComponentBuilder| {
-                    let (type_index, type_encoder) = component.core_type();
-                    type_encoder.function(
-                        ty.params().iter().map(convert),
-                        ty.results().iter().map(convert),
-                    );
-                    type_index
-                };
-
-                if let Some((name, ty)) = info.start_import.as_ref() {
-                    let type_index = add_type(ty, &mut self.component);
-                    let index = self.component.async_start(type_index);
+                if let Some(name) = info.start_import.as_ref() {
+                    let index = self.component.async_start(component_type_index);
                     exports.push((name.as_str(), ExportKind::Func, index));
                 }
-                if let Some((name, ty)) = info.return_import.as_ref() {
-                    let type_index = add_type(ty, &mut self.component);
-                    let index = self.component.async_return(type_index);
+                if let Some(name) = info.return_import.as_ref() {
+                    let index = self.component.async_return(component_type_index);
                     exports.push((name.as_str(), ExportKind::Func, index));
                 }
             }
@@ -1678,7 +1676,7 @@ impl<'a> EncodingState<'a> {
         &mut self,
         shims: &Shims<'_>,
         name: &'a str,
-        adapter: &WorldAdapter,
+        adapter: &'a WorldAdapter,
     ) {
         let mut args = Vec::new();
 

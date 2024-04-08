@@ -2254,6 +2254,11 @@ impl Printer {
                     self.end_group();
                 }
                 CanonicalOption::Async => self.result.push_str("async"),
+                CanonicalOption::Callback(idx) => {
+                    self.start_group("callback ");
+                    self.print_idx(&state.core.func_names, *idx)?;
+                    self.end_group();
+                }
             }
         }
         Ok(())
@@ -2335,22 +2340,26 @@ impl Printer {
                     self.end_group();
                     state.core.funcs += 1;
                 }
-                CanonicalFunction::AsyncStart { type_index } => {
+                CanonicalFunction::AsyncStart {
+                    component_type_index,
+                } => {
                     self.start_group("core func ");
                     self.print_name(&state.core.func_names, state.core.funcs)?;
                     self.result.push(' ');
                     self.start_group("canon call.start ");
-                    self.print_idx(&state.component.type_names, type_index)?;
+                    self.print_idx(&state.component.type_names, component_type_index)?;
                     self.end_group();
                     self.end_group();
                     state.core.funcs += 1;
                 }
-                CanonicalFunction::AsyncReturn { type_index } => {
+                CanonicalFunction::AsyncReturn {
+                    component_type_index,
+                } => {
                     self.start_group("core func ");
                     self.print_name(&state.core.func_names, state.core.funcs)?;
                     self.result.push(' ');
                     self.start_group("canon call.return ");
-                    self.print_idx(&state.component.type_names, type_index)?;
+                    self.print_idx(&state.component.type_names, component_type_index)?;
                     self.end_group();
                     self.end_group();
                     state.core.funcs += 1;

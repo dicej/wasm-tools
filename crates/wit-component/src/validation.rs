@@ -52,6 +52,7 @@ pub const ASYNC_START: &str = "[async-start]";
 pub const ASYNC_RETURN: &str = "[async-return]";
 
 pub const POST_RETURN_PREFIX: &str = "cabi_post_";
+pub const CALLBACK_PREFIX: &str = "[callback]";
 
 /// Metadata about a validated module and what was found internally.
 ///
@@ -88,7 +89,7 @@ pub struct ValidatedModule<'a> {
     /// itself.
     pub required_resource_funcs: IndexMap<String, IndexMap<String, ResourceInfo>>,
 
-    pub required_async_funcs: IndexMap<String, IndexMap<String, AsyncExportInfo>>,
+    pub required_async_funcs: IndexMap<String, IndexMap<String, AsyncExportInfo<'a>>>,
 
     /// Whether or not this module exported a linear memory.
     pub has_memory: bool,
@@ -105,6 +106,10 @@ pub struct ValidatedModule<'a> {
     /// Post-return functions annotated with `cabi_post_*` in their function
     /// name.
     pub post_returns: IndexSet<String>,
+
+    /// Callback functions annotated with `[callback]*` in their function
+    /// name.
+    pub callbacks: IndexSet<String>,
 }
 
 #[derive(Default)]
@@ -121,9 +126,11 @@ pub struct ResourceInfo {
     pub id: TypeId,
 }
 
-pub struct AsyncExportInfo {
-    pub start_import: Option<(String, FuncType)>,
-    pub return_import: Option<(String, FuncType)>,
+pub struct AsyncExportInfo<'a> {
+    pub interface: Option<InterfaceId>,
+    pub function: &'a Function,
+    pub start_import: Option<String>,
+    pub return_import: Option<String>,
 }
 
 /// This function validates the following:
@@ -157,6 +164,7 @@ pub fn validate_module<'a>(
         required_async_funcs: Default::default(),
         required_resource_funcs: Default::default(),
         post_returns: Default::default(),
+        callbacks: Default::default(),
     };
 
     for payload in Parser::new(0).parse_all(bytes) {
@@ -276,6 +284,7 @@ pub fn validate_module<'a>(
             &export_funcs,
             &types,
             &mut ret.post_returns,
+            &mut ret.callbacks,
             &mut ret.required_async_funcs,
             &mut ret.required_resource_funcs,
         )?;
@@ -302,13 +311,13 @@ pub fn validate_module<'a>(
     Ok(ret)
 }
 
-fn validate_exported_interface_resource_and_async_imports<'a>(
-    resolve: &Resolve,
+fn validate_exported_interface_resource_and_async_imports<'a, 'b>(
+    resolve: &'b Resolve,
     interface: InterfaceId,
     import_module: &str,
     funcs: &IndexMap<&'a str, u32>,
     types: &Types,
-    required_async_funcs: &mut IndexMap<String, IndexMap<String, AsyncExportInfo>>,
+    required_async_funcs: &mut IndexMap<String, IndexMap<String, AsyncExportInfo<'b>>>,
     required_resource_funcs: &mut IndexMap<String, IndexMap<String, ResourceInfo>>,
 ) -> Result<()> {
     let is_resource = |name: &str| match resolve.interfaces[interface].types.get(name) {
@@ -317,17 +326,12 @@ fn validate_exported_interface_resource_and_async_imports<'a>(
     };
     for (func_name, ty) in funcs {
         if let Some(info) = required_async_funcs.get_mut(import_module) {
-            let func_type = |ty| {
-                types[types.core_type_at(ty).unwrap_sub()]
-                    .unwrap_func()
-                    .clone()
-            };
             if let Some(function_name) = func_name.strip_prefix(ASYNC_START) {
-                info[function_name].start_import = Some((func_name.to_string(), func_type(*ty)));
+                info[function_name].start_import = Some(func_name.to_string());
                 continue;
             }
             if let Some(function_name) = func_name.strip_prefix(ASYNC_RETURN) {
-                info[function_name].return_import = Some((func_name.to_string(), func_type(*ty)));
+                info[function_name].return_import = Some(func_name.to_string());
                 continue;
             }
         }
@@ -373,7 +377,7 @@ pub struct ValidatedAdapter<'a> {
     /// itself.
     pub required_resource_funcs: IndexMap<String, IndexMap<String, ResourceInfo>>,
 
-    pub required_async_funcs: IndexMap<String, IndexMap<String, AsyncExportInfo>>,
+    pub required_async_funcs: IndexMap<String, IndexMap<String, AsyncExportInfo<'a>>>,
 
     /// This is the module and field name of the memory import, if one is
     /// specified.
@@ -400,6 +404,10 @@ pub struct ValidatedAdapter<'a> {
     /// Post-return functions annotated with `cabi_post_*` in their function
     /// name.
     pub post_returns: IndexSet<String>,
+
+    /// Callback functions annotated with `[callback]*` in their function
+    /// name.
+    pub callbacks: IndexSet<String>,
 }
 
 /// This function will validate the `bytes` provided as a wasm adapter module.
@@ -444,6 +452,7 @@ pub fn validate_adapter_module<'a>(
         export_realloc: None,
         metadata,
         post_returns: Default::default(),
+        callbacks: Default::default(),
     };
 
     let mut cabi_realloc = None;
@@ -602,6 +611,7 @@ pub fn validate_adapter_module<'a>(
             &export_funcs,
             &types,
             &mut ret.post_returns,
+            &mut ret.callbacks,
             &mut ret.required_async_funcs,
             &mut ret.required_resource_funcs,
         )?;
@@ -766,7 +776,7 @@ fn validate_imported_interface(
                     }
                     None => bail!(
                         "import interface `{name}` is missing function \
-                     `{func_name}` that is required by the module",
+                         `{func_name}` that is required by the module",
                     ),
                 },
             }
@@ -809,6 +819,14 @@ fn validate_post_return(
     )
 }
 
+fn validate_callback(ty: &FuncType, func: &Function) -> Result<()> {
+    validate_func_sig(
+        &format!("{} callback", func.name),
+        &FuncType::new([ValType::I32; 4], [ValType::I32]),
+        ty,
+    )
+}
+
 fn validate_func_sig(name: &str, expected: &FuncType, ty: &wasmparser::FuncType) -> Result<()> {
     if ty != expected {
         bail!(
@@ -831,12 +849,15 @@ fn validate_exported_item<'a>(
     exports: &IndexMap<&str, u32>,
     types: &Types,
     post_returns: &mut IndexSet<String>,
-    required_async_funcs: &mut IndexMap<String, IndexMap<String, AsyncExportInfo>>,
+    callbacks: &mut IndexSet<String>,
+    required_async_funcs: &mut IndexMap<String, IndexMap<String, AsyncExportInfo<'a>>>,
     required_resource_funcs: &mut IndexMap<String, IndexMap<String, ResourceInfo>>,
 ) -> Result<()> {
     let mut validate =
-        |func: &Function, name: Option<&str>, async_map: &mut IndexMap<String, AsyncExportInfo>| {
-            let expected_export_name = func.core_export_name(name);
+        |func: &'a Function,
+         interface: Option<(&str, InterfaceId)>,
+         async_map: &mut IndexMap<String, AsyncExportInfo<'a>>| {
+            let expected_export_name = func.core_export_name(interface.map(|(n, _)| n));
             let (abi, func_index) = match exports.get(expected_export_name.as_ref()) {
                 Some(func_index) => (AbiVariant::GuestExport, func_index),
                 None => match exports.get(format!("[async]{expected_export_name}").as_str()) {
@@ -844,6 +865,8 @@ fn validate_exported_item<'a>(
                         async_map.insert(
                             func.name.clone(),
                             AsyncExportInfo {
+                                interface: interface.map(|(_, id)| id),
+                                function: func,
                                 start_import: None,
                                 return_import: None,
                             },
@@ -870,6 +893,15 @@ fn validate_exported_item<'a>(
                 validate_post_return(resolve, ty, func)?;
             }
 
+            let callback = format!("{CALLBACK_PREFIX}{expected_export_name}");
+            if let Some(index) = exports.get(&callback[..]) {
+                let ok = callbacks.insert(callback);
+                assert!(ok);
+                let id = types.core_function_at(*index);
+                let ty = types[id].unwrap_func();
+                validate_callback(ty, func)?;
+            }
+
             Ok(())
         };
 
@@ -881,13 +913,13 @@ fn validate_exported_item<'a>(
                 .entry(format!("[export]{BARE_FUNC_MODULE_NAME}"))
                 .or_default(),
         )?,
-        WorldItem::Interface(interface) => {
-            let interface = &resolve.interfaces[*interface];
+        WorldItem::Interface(interface_id) => {
+            let interface = &resolve.interfaces[*interface_id];
             let mut async_map = IndexMap::new();
             for (_, f) in interface.functions.iter() {
-                validate(f, Some(export_name), &mut async_map).with_context(|| {
-                    format!("failed to validate exported interface `{export_name}`")
-                })?;
+                validate(f, Some((export_name, *interface_id)), &mut async_map).with_context(
+                    || format!("failed to validate exported interface `{export_name}`"),
+                )?;
             }
             let prev = required_async_funcs.insert(format!("[export]{export_name}"), async_map);
             assert!(prev.is_none());

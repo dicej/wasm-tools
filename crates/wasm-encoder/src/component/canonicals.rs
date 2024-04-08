@@ -23,6 +23,8 @@ pub enum CanonicalOption {
     PostReturn(u32),
     /// TODO: docs
     Async,
+    /// TODO: docs
+    Callback(u32),
 }
 
 impl Encode for CanonicalOption {
@@ -45,6 +47,10 @@ impl Encode for CanonicalOption {
             }
             Self::Async => {
                 sink.push(0x06);
+            }
+            Self::Callback(idx) => {
+                sink.push(0x07);
+                idx.encode(sink);
             }
         }
     }
@@ -151,17 +157,17 @@ impl CanonicalFunctionSection {
     }
 
     /// TODO: docs
-    pub fn async_start(&mut self, type_index: u32) -> &mut Self {
+    pub fn async_start(&mut self, component_type_index: u32) -> &mut Self {
         self.bytes.push(0x05);
-        type_index.encode(&mut self.bytes);
+        component_type_index.encode(&mut self.bytes);
         self.num_added += 1;
         self
     }
 
     /// TODO: docs
-    pub fn async_return(&mut self, type_index: u32) -> &mut Self {
+    pub fn async_return(&mut self, component_type_index: u32) -> &mut Self {
         self.bytes.push(0x06);
-        type_index.encode(&mut self.bytes);
+        component_type_index.encode(&mut self.bytes);
         self.num_added += 1;
         self
     }

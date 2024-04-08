@@ -373,14 +373,15 @@ impl ComponentBuilder {
     }
 
     /// TODO: docs
-    pub fn async_start(&mut self, type_index: u32) -> u32 {
-        self.canonical_functions().async_start(type_index);
+    pub fn async_start(&mut self, component_type_index: u32) -> u32 {
+        self.canonical_functions().async_start(component_type_index);
         inc(&mut self.core_funcs)
     }
 
     /// TODO: docs
-    pub fn async_return(&mut self, type_index: u32) -> u32 {
-        self.canonical_functions().async_return(type_index);
+    pub fn async_return(&mut self, component_type_index: u32) -> u32 {
+        self.canonical_functions()
+            .async_return(component_type_index);
         inc(&mut self.core_funcs)
     }
 

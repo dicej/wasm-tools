@@ -1078,14 +1078,30 @@ impl ComponentState {
 
     pub fn async_start(
         &mut self,
-        type_index: u32,
+        component_type_index: u32,
         types: &mut TypeAlloc,
         offset: usize,
     ) -> Result<()> {
-        let ty = self
-            .core_function_type_at(type_index, types, offset)?
+        let mut component_type = self
+            .function_type_at(component_type_index, types, offset)?
             .clone();
-        let (_is_new, group_id) = types.intern_canonical_rec_group(RecGroup::implicit(offset, ty));
+        component_type.results = Vec::from(mem::replace(&mut component_type.params, Box::new([])))
+            .into_iter()
+            .map(|(k, v)| (Some(k), v))
+            .collect();
+        let info = component_type.lower(types, true, false);
+
+        let (_is_new, group_id) = types.intern_canonical_rec_group(RecGroup::implicit(
+            offset,
+            SubType {
+                is_final: true,
+                supertype_idx: None,
+                composite_type: CompositeType::Func(FuncType::new(
+                    info.params.iter(),
+                    info.results.iter(),
+                )),
+            },
+        ));
         let id = types[group_id].start;
         self.core_funcs.push(id);
         Ok(())
@@ -1093,14 +1109,36 @@ impl ComponentState {
 
     pub fn async_return(
         &mut self,
-        type_index: u32,
+        component_type_index: u32,
         types: &mut TypeAlloc,
         offset: usize,
     ) -> Result<()> {
-        let ty = self
-            .core_function_type_at(type_index, types, offset)?
+        let mut component_type = self
+            .function_type_at(component_type_index, types, offset)?
             .clone();
-        let (_is_new, group_id) = types.intern_canonical_rec_group(RecGroup::implicit(offset, ty));
+        component_type.params = Vec::from(mem::replace(&mut component_type.results, Box::new([])))
+            .into_iter()
+            .enumerate()
+            .map(|(index, (k, v))| {
+                (
+                    k.unwrap_or_else(|| KebabString::new(format!("p{index}")).unwrap()),
+                    v,
+                )
+            })
+            .collect();
+        let info = component_type.lower(types, true, false);
+
+        let (_is_new, group_id) = types.intern_canonical_rec_group(RecGroup::implicit(
+            offset,
+            SubType {
+                is_final: true,
+                supertype_idx: None,
+                composite_type: CompositeType::Func(FuncType::new(
+                    info.params.iter(),
+                    info.results.iter(),
+                )),
+            },
+        ));
         let id = types[group_id].start;
         self.core_funcs.push(id);
         Ok(())
@@ -1289,6 +1327,7 @@ impl ComponentState {
                 CanonicalOption::Realloc(_) => "realloc",
                 CanonicalOption::PostReturn(_) => "post-return",
                 CanonicalOption::Async => "async",
+                CanonicalOption::Callback(_) => "callback",
             }
         }
 
@@ -1378,7 +1417,7 @@ impl ComponentState {
                     }
                 }
                 // TODO
-                CanonicalOption::Async => {}
+                CanonicalOption::Async | CanonicalOption::Callback(_) => {}
             }
         }
 
@@ -2785,19 +2824,6 @@ impl ComponentState {
             .get(idx as usize)
             .copied()
             .ok_or_else(|| format_err!(offset, "unknown type {idx}: type index out of bounds"))
-    }
-
-    fn core_function_type_at<'a>(
-        &self,
-        idx: u32,
-        types: &'a TypeList,
-        offset: usize,
-    ) -> Result<&'a SubType> {
-        let id = self.core_type_at(idx, offset)?;
-        match id {
-            ComponentCoreTypeId::Sub(id) => Ok(&types[id]),
-            _ => bail!(offset, "type index {idx} is not a function type"),
-        }
     }
 
     pub fn component_type_at(&self, idx: u32, offset: usize) -> Result<ComponentAnyTypeId> {
