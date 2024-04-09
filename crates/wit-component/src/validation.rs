@@ -52,7 +52,7 @@ pub const ASYNC_START: &str = "[async-start]";
 pub const ASYNC_RETURN: &str = "[async-return]";
 
 pub const POST_RETURN_PREFIX: &str = "cabi_post_";
-pub const CALLBACK_PREFIX: &str = "[callback]";
+pub const CALLBACK_PREFIX: &str = "[callback][async]";
 
 /// Metadata about a validated module and what was found internally.
 ///
