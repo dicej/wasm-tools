@@ -56,6 +56,8 @@ impl SizeAlign {
             TypeDefKind::Future(_) => (4, 4),
             // A stream is represented as an index.
             TypeDefKind::Stream(_) => (4, 4),
+            // An error is represented as an index.
+            TypeDefKind::Error => (4, 4),
             // This shouldn't be used for anything since raw resources aren't part of the ABI -- just handles to
             // them.
             TypeDefKind::Resource => (usize::MAX, usize::MAX),

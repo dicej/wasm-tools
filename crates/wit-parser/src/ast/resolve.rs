@@ -98,7 +98,8 @@ enum Key {
     Option(Type),
     Result(Option<Type>, Option<Type>),
     Future(Option<Type>),
-    Stream(Option<Type>, Option<Type>),
+    Stream(Type),
+    Error,
 }
 
 enum TypeItem<'a, 'b> {
@@ -1171,10 +1172,8 @@ impl<'a> Resolver<'a> {
                 err: self.resolve_optional_type(r.err.as_deref())?,
             }),
             ast::Type::Future(t) => TypeDefKind::Future(self.resolve_optional_type(t.as_deref())?),
-            ast::Type::Stream(s) => TypeDefKind::Stream(Stream {
-                element: self.resolve_optional_type(s.element.as_deref())?,
-                end: self.resolve_optional_type(s.end.as_deref())?,
-            }),
+            ast::Type::Stream(t) => TypeDefKind::Stream(self.resolve_type(t)?),
+            ast::Type::Error => TypeDefKind::Error,
         })
     }
 
@@ -1220,6 +1219,7 @@ impl<'a> Resolver<'a> {
             _ => {}
         }
         let kind = self.resolve_type_def(ty)?;
+
         Ok(self.anon_type_def(TypeDef {
             kind,
             name: None,
@@ -1268,7 +1268,8 @@ impl<'a> Resolver<'a> {
             TypeDefKind::Option(t) => Key::Option(*t),
             TypeDefKind::Result(r) => Key::Result(r.ok, r.err),
             TypeDefKind::Future(ty) => Key::Future(*ty),
-            TypeDefKind::Stream(s) => Key::Stream(s.element, s.end),
+            TypeDefKind::Stream(ty) => Key::Stream(*ty),
+            TypeDefKind::Error => Key::Error,
             TypeDefKind::Unknown => unreachable!(),
         };
         let types = &mut self.types;
@@ -1392,9 +1393,9 @@ fn collect_deps<'a>(ty: &ast::Type<'a>, deps: &mut Vec<ast::Id<'a>>) {
         | ast::Type::Char
         | ast::Type::String
         | ast::Type::Flags(_)
-        | ast::Type::Enum(_) => {}
+        | ast::Type::Enum(_)
+        | ast::Type::Error => {}
         ast::Type::Name(name) => deps.push(name.clone()),
-        ast::Type::List(list) => collect_deps(list, deps),
         ast::Type::Handle(handle) => match handle {
             ast::Handle::Own { resource } => deps.push(resource.clone()),
             ast::Handle::Borrow { resource } => deps.push(resource.clone()),
@@ -1417,7 +1418,9 @@ fn collect_deps<'a>(ty: &ast::Type<'a>, deps: &mut Vec<ast::Id<'a>>) {
                 }
             }
         }
-        ast::Type::Option(ty) => collect_deps(ty, deps),
+        ast::Type::Option(ty) | ast::Type::List(ty) | ast::Type::Stream(ty) => {
+            collect_deps(ty, deps)
+        }
         ast::Type::Result(r) => {
             if let Some(ty) = &r.ok {
                 collect_deps(ty, deps);
@@ -1429,14 +1432,6 @@ fn collect_deps<'a>(ty: &ast::Type<'a>, deps: &mut Vec<ast::Id<'a>>) {
         ast::Type::Future(t) => {
             if let Some(t) = t {
                 collect_deps(t, deps)
-            }
-        }
-        ast::Type::Stream(s) => {
-            if let Some(t) = &s.element {
-                collect_deps(t, deps);
-            }
-            if let Some(t) = &s.end {
-                collect_deps(t, deps);
             }
         }
     }

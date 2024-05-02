@@ -297,6 +297,10 @@ impl Resolve {
                     result.push(WasmType::I32);
                 }
 
+                TypeDefKind::Error => {
+                    result.push(WasmType::I32);
+                }
+
                 TypeDefKind::Unknown => unreachable!(),
             },
         }

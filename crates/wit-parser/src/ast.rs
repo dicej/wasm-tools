@@ -556,7 +556,8 @@ enum Type<'a> {
     Option(Box<Type<'a>>),
     Result(Result_<'a>),
     Future(Option<Box<Type<'a>>>),
-    Stream(Stream<'a>),
+    Stream(Box<Type<'a>>),
+    Error,
 }
 
 enum Handle<'a> {
@@ -666,11 +667,6 @@ struct EnumCase<'a> {
 struct Result_<'a> {
     ok: Option<Box<Type<'a>>>,
     err: Option<Box<Type<'a>>>,
-}
-
-struct Stream<'a> {
-    element: Option<Box<Type<'a>>>,
-    end: Option<Box<Type<'a>>>,
 }
 
 struct NamedFunc<'a> {
@@ -1039,28 +1035,17 @@ impl<'a> Type<'a> {
                 Ok(Type::Future(ty))
             }
 
-            // stream<T, Z>
-            // stream<_, Z>
             // stream<T>
             // stream
             Some((_span, Token::Stream)) => {
-                let mut element = None;
-                let mut end = None;
-
-                if tokens.eat(Token::LessThan)? {
-                    if tokens.eat(Token::Underscore)? {
-                        tokens.expect(Token::Comma)?;
-                        end = Some(Box::new(Type::parse(tokens)?));
-                    } else {
-                        element = Some(Box::new(Type::parse(tokens)?));
-                        if tokens.eat(Token::Comma)? {
-                            end = Some(Box::new(Type::parse(tokens)?));
-                        }
-                    };
-                    tokens.expect(Token::GreaterThan)?;
-                };
-                Ok(Type::Stream(Stream { element, end }))
+                tokens.expect(Token::LessThan)?;
+                let ty = Type::parse(tokens)?;
+                tokens.expect(Token::GreaterThan)?;
+                Ok(Type::Stream(Box::new(ty)))
             }
+
+            // error
+            Some((_span, Token::Error)) => Ok(Type::Error),
 
             // own<T>
             Some((_span, Token::Own)) => {

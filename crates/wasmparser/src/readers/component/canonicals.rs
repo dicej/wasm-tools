@@ -73,6 +73,70 @@ pub enum CanonicalFunction {
         /// TODO: docs
         component_type_index: u32,
     },
+    /// TODO: docs
+    FutureNew {
+        /// TODO: docs
+        ty: u32,
+        /// TODO: docs
+        memory: u32,
+    },
+    /// TODO: docs
+    FutureSend {
+        /// TODO: docs
+        ty: u32,
+        /// TODO: docs
+        options: Box<[CanonicalOption]>,
+    },
+    /// TODO: docs
+    FutureReceive {
+        /// TODO: docs
+        ty: u32,
+        /// TODO: docs
+        options: Box<[CanonicalOption]>,
+    },
+    /// TODO: docs
+    FutureDropSender {
+        /// TODO: docs
+        ty: u32,
+    },
+    /// TODO: docs
+    FutureDropReceiver {
+        /// TODO: docs
+        ty: u32,
+    },
+    /// TODO: docs
+    StreamNew {
+        /// TODO: docs
+        ty: u32,
+        /// TODO: docs
+        memory: u32,
+    },
+    /// TODO: docs
+    StreamSend {
+        /// TODO: docs
+        ty: u32,
+        /// TODO: docs
+        options: Box<[CanonicalOption]>,
+    },
+    /// TODO: docs
+    StreamReceive {
+        /// TODO: docs
+        ty: u32,
+        /// TODO: docs
+        options: Box<[CanonicalOption]>,
+    },
+    /// TODO: docs
+    StreamDropSender {
+        /// TODO: docs
+        ty: u32,
+    },
+    /// TODO: docs
+    StreamDropReceiver {
+        /// TODO: docs
+        ty: u32,
+    },
+    /// TODO: docs
+    ErrorDrop,
 }
 
 /// A reader for the canonical section of a WebAssembly component.
@@ -120,6 +184,43 @@ impl<'a> FromReader<'a> for CanonicalFunction {
             0x06 => CanonicalFunction::AsyncReturn {
                 component_type_index: reader.read()?,
             },
+            0x07 => CanonicalFunction::FutureNew {
+                ty: reader.read()?,
+                memory: reader.read()?,
+            },
+            0x08 => CanonicalFunction::FutureSend {
+                ty: reader.read()?,
+                options: reader
+                    .read_iter(MAX_WASM_CANONICAL_OPTIONS, "canonical options")?
+                    .collect::<Result<_>>()?,
+            },
+            0x09 => CanonicalFunction::FutureReceive {
+                ty: reader.read()?,
+                options: reader
+                    .read_iter(MAX_WASM_CANONICAL_OPTIONS, "canonical options")?
+                    .collect::<Result<_>>()?,
+            },
+            0x0a => CanonicalFunction::FutureDropSender { ty: reader.read()? },
+            0x0b => CanonicalFunction::FutureDropReceiver { ty: reader.read()? },
+            0x0c => CanonicalFunction::StreamNew {
+                ty: reader.read()?,
+                memory: reader.read()?,
+            },
+            0x0d => CanonicalFunction::StreamSend {
+                ty: reader.read()?,
+                options: reader
+                    .read_iter(MAX_WASM_CANONICAL_OPTIONS, "canonical options")?
+                    .collect::<Result<_>>()?,
+            },
+            0x0e => CanonicalFunction::StreamReceive {
+                ty: reader.read()?,
+                options: reader
+                    .read_iter(MAX_WASM_CANONICAL_OPTIONS, "canonical options")?
+                    .collect::<Result<_>>()?,
+            },
+            0x0f => CanonicalFunction::StreamDropSender { ty: reader.read()? },
+            0x10 => CanonicalFunction::StreamDropReceiver { ty: reader.read()? },
+            0x11 => CanonicalFunction::ErrorDrop,
             x => return reader.invalid_leading_byte(x, "canonical function"),
         })
     }

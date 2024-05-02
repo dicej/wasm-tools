@@ -401,7 +401,8 @@ pub enum TypeDefKind {
     Result(Result_),
     List(Type),
     Future(Option<Type>),
-    Stream(Stream),
+    Stream(Type),
+    Error,
     Type(Type),
 
     /// This represents a type of unknown structure imported from a foreign
@@ -430,6 +431,7 @@ impl TypeDefKind {
             TypeDefKind::List(_) => "list",
             TypeDefKind::Future(_) => "future",
             TypeDefKind::Stream(_) => "stream",
+            TypeDefKind::Error => "error",
             TypeDefKind::Type(_) => "type",
             TypeDefKind::Unknown => "unknown",
         }
@@ -612,13 +614,6 @@ pub struct Result_ {
     pub err: Option<Type>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Serialize))]
-pub struct Stream {
-    pub element: Option<Type>,
-    pub end: Option<Type>,
-}
-
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct Docs {
@@ -743,6 +738,68 @@ impl Function {
         match interface {
             Some(interface) => Cow::Owned(format!("{interface}#{}", self.name)),
             None => Cow::Borrowed(&self.name),
+        }
+    }
+
+    pub fn find_futures_and_streams(&self, resolve: &Resolve) -> Vec<TypeId> {
+        let mut results = Vec::new();
+        for (_, ty) in self.params.iter() {
+            find_futures_and_streams(resolve, *ty, &mut results);
+        }
+        for ty in self.results.iter_types() {
+            find_futures_and_streams(resolve, *ty, &mut results);
+        }
+        results
+    }
+}
+
+fn find_futures_and_streams(resolve: &Resolve, ty: Type, results: &mut Vec<TypeId>) {
+    if let Type::Id(id) = ty {
+        match &resolve.types[id].kind {
+            TypeDefKind::Resource
+            | TypeDefKind::Handle(_)
+            | TypeDefKind::Flags(_)
+            | TypeDefKind::Enum(_)
+            | TypeDefKind::Error => {}
+            TypeDefKind::Record(r) => {
+                for Field { ty, .. } in &r.fields {
+                    find_futures_and_streams(resolve, *ty, results);
+                }
+            }
+            TypeDefKind::Tuple(t) => {
+                for ty in &t.types {
+                    find_futures_and_streams(resolve, *ty, results);
+                }
+            }
+            TypeDefKind::Variant(v) => {
+                for Case { ty, .. } in &v.cases {
+                    if let Some(ty) = ty {
+                        find_futures_and_streams(resolve, *ty, results);
+                    }
+                }
+            }
+            TypeDefKind::Option(ty) | TypeDefKind::List(ty) | TypeDefKind::Type(ty) => {
+                find_futures_and_streams(resolve, *ty, results);
+            }
+            TypeDefKind::Result(r) => {
+                if let Some(ty) = r.ok {
+                    find_futures_and_streams(resolve, ty, results);
+                }
+                if let Some(ty) = r.err {
+                    find_futures_and_streams(resolve, ty, results);
+                }
+            }
+            TypeDefKind::Future(ty) => {
+                if let Some(ty) = ty {
+                    find_futures_and_streams(resolve, *ty, results);
+                }
+                results.push(id);
+            }
+            TypeDefKind::Stream(ty) => {
+                find_futures_and_streams(resolve, *ty, results);
+                results.push(id);
+            }
+            TypeDefKind::Unknown => unreachable!(),
         }
     }
 }

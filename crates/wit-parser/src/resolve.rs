@@ -4,8 +4,8 @@ use crate::ast::{parse_use_path, AstUsePath};
 use crate::serde_::{serialize_arena, serialize_id_map};
 use crate::{
     AstItem, Docs, Error, Function, FunctionKind, Handle, IncludeName, Interface, InterfaceId,
-    PackageName, Results, Type, TypeDef, TypeDefKind, TypeId, TypeOwner, UnresolvedPackage, World,
-    WorldId, WorldItem, WorldKey,
+    PackageName, Result_, Results, Type, TypeDef, TypeDefKind, TypeId, TypeOwner,
+    UnresolvedPackage, World, WorldId, WorldItem, WorldKey,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use id_arena::{Arena, Id};
@@ -368,7 +368,8 @@ impl Resolve {
                 | TypeDefKind::Option(_)
                 | TypeDefKind::Result(_)
                 | TypeDefKind::Future(_)
-                | TypeDefKind::Stream(_) => false,
+                | TypeDefKind::Stream(_)
+                | TypeDefKind::Error => false,
                 TypeDefKind::Type(t) => self.all_bits_valid(t),
 
                 TypeDefKind::Handle(h) => match h {
@@ -1041,6 +1042,139 @@ impl Resolve {
             }
         }
     }
+
+    pub fn add_future_and_stream_results(&mut self) {
+        let err = Some(Type::Id(self.types.alloc(TypeDef {
+            kind: TypeDefKind::Error,
+            name: None,
+            docs: Docs::default(),
+            owner: TypeOwner::None,
+        })));
+
+        self.types.alloc(TypeDef {
+            kind: TypeDefKind::Result(Result_ { ok: None, err }),
+            name: None,
+            docs: Docs::default(),
+            owner: TypeOwner::None,
+        });
+
+        let types = self
+            .types
+            .iter()
+            .filter_map(|(id, ty)| match &ty.kind {
+                TypeDefKind::Future(_) | TypeDefKind::Stream(_) => Some(id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        for id in types {
+            match self.types[id].kind.clone() {
+                TypeDefKind::Future(ty) => {
+                    self.types.alloc(TypeDef {
+                        kind: TypeDefKind::Result(Result_ { ok: ty, err }),
+                        name: None,
+                        docs: Docs::default(),
+                        owner: TypeOwner::None,
+                    });
+                }
+                TypeDefKind::Stream(ty) => {
+                    let ok = Some(Type::Id(self.types.alloc(TypeDef {
+                        kind: TypeDefKind::List(ty),
+                        name: None,
+                        docs: Docs::default(),
+                        owner: TypeOwner::None,
+                    })));
+                    let result = Type::Id(self.types.alloc(TypeDef {
+                        kind: TypeDefKind::Result(Result_ { ok, err }),
+                        name: None,
+                        docs: Docs::default(),
+                        owner: TypeOwner::None,
+                    }));
+                    self.types.alloc(TypeDef {
+                        kind: TypeDefKind::Option(result),
+                        name: None,
+                        docs: Docs::default(),
+                        owner: TypeOwner::None,
+                    });
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    pub fn find_future_and_stream_results(&self) -> (Option<TypeId>, HashMap<TypeId, TypeId>) {
+        #[derive(Copy, Clone, Hash, PartialEq, Eq)]
+        enum PayloadType {
+            Future(Option<Type>),
+            Stream(Type),
+        }
+
+        let mut unit_result = None;
+
+        let mut types = HashMap::<_, HashSet<_>>::new();
+        for (id, ty) in &self.types {
+            match &ty.kind {
+                TypeDefKind::Future(ty) => {
+                    types
+                        .entry(PayloadType::Future(*ty))
+                        .or_default()
+                        .insert(id);
+                }
+                TypeDefKind::Stream(ty) => {
+                    types
+                        .entry(PayloadType::Stream(*ty))
+                        .or_default()
+                        .insert(id);
+                }
+                _ => {}
+            }
+        }
+
+        let mut payload_results = HashMap::new();
+        for (id, ty) in &self.types {
+            match &ty.kind {
+                TypeDefKind::Option(Type::Id(ty)) => {
+                    if let TypeDefKind::Result(Result_ {
+                        ok: Some(Type::Id(ok)),
+                        err: Some(Type::Id(err)),
+                    }) = &self.types[*ty].kind
+                    {
+                        if let (TypeDefKind::List(ok), TypeDefKind::Error) =
+                            (&self.types[*ok].kind, &self.types[*err].kind)
+                        {
+                            if let Some(types) = types.get(&PayloadType::Stream(*ok)) {
+                                for ty in types {
+                                    payload_results.insert(*ty, id);
+                                }
+                            }
+                        }
+                    }
+                }
+                TypeDefKind::Result(Result_ {
+                    ok,
+                    err: Some(Type::Id(err)),
+                }) => {
+                    if let TypeDefKind::Error = &self.types[*err].kind {
+                        if let Some(types) = types.get(&PayloadType::Future(*ok)) {
+                            for ty in types {
+                                payload_results.insert(*ty, id);
+                            }
+                        }
+                        if ok.is_none() {
+                            unit_result = Some(id);
+                        }
+                    }
+                }
+                _ => (),
+            }
+        }
+
+        if unit_result.is_none() {
+            eprintln!("couldn't find unit result in {:#?}", self.types);
+        }
+
+        (unit_result, payload_results)
+    }
 }
 
 /// Structure returned by [`Resolve::merge`] which contains mappings from
@@ -1400,7 +1534,7 @@ impl Remap {
                     }
                 }
             }
-            Option(t) => self.update_ty(resolve, t),
+            Option(t) | List(t) | Stream(t) => self.update_ty(resolve, t),
             Result(r) => {
                 if let Some(ty) = &mut r.ok {
                     self.update_ty(resolve, ty);
@@ -1409,16 +1543,8 @@ impl Remap {
                     self.update_ty(resolve, ty);
                 }
             }
-            List(t) => self.update_ty(resolve, t),
             Future(Some(t)) => self.update_ty(resolve, t),
-            Stream(t) => {
-                if let Some(ty) = &mut t.element {
-                    self.update_ty(resolve, ty);
-                }
-                if let Some(ty) = &mut t.end {
-                    self.update_ty(resolve, ty);
-                }
-            }
+            Error => {}
 
             // Note that `update_ty` is specifically not used here as typedefs
             // because for the `type a = b` form that doesn't force `a` to be a

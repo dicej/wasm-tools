@@ -132,7 +132,7 @@ pub trait ValtypeEncoder<'a> {
                 // it as it was bound here with an alias.
                 let ty = &resolve.types[id];
                 log::trace!("encode type name={:?} {:?}", ty.name, &ty.kind);
-                if let Some(index) = self.maybe_import_type(resolve, id) {
+                if let Some(index) = self.maybe_import_type(resolve, dealias(resolve, id)) {
                     self.type_map().insert(id, index);
                     return Ok(ComponentValType::Type(index));
                 }
@@ -153,8 +153,9 @@ pub trait ValtypeEncoder<'a> {
                         ComponentValType::Type(index)
                     }
                     TypeDefKind::Type(ty) => self.encode_valtype(resolve, ty)?,
-                    TypeDefKind::Future(_) => todo!("encoding for future type"),
-                    TypeDefKind::Stream(_) => todo!("encoding for stream type"),
+                    TypeDefKind::Future(ty) => self.encode_future(resolve, ty)?,
+                    TypeDefKind::Stream(ty) => self.encode_stream(resolve, ty)?,
+                    TypeDefKind::Error => self.encode_error()?,
                     TypeDefKind::Unknown => unreachable!(),
                     TypeDefKind::Resource => {
                         let name = ty.name.as_ref().expect("resources must be named");
@@ -309,6 +310,30 @@ pub trait ValtypeEncoder<'a> {
         encoder.enum_type(enum_.cases.iter().map(|c| c.name.as_str()));
         Ok(ComponentValType::Type(index))
     }
+
+    fn encode_future(
+        &mut self,
+        resolve: &'a Resolve,
+        payload: &Option<Type>,
+    ) -> Result<ComponentValType> {
+        let ty = self.encode_optional_valtype(resolve, payload.as_ref())?;
+        let (index, encoder) = self.defined_type();
+        encoder.future(ty);
+        Ok(ComponentValType::Type(index))
+    }
+
+    fn encode_stream(&mut self, resolve: &'a Resolve, payload: &Type) -> Result<ComponentValType> {
+        let ty = self.encode_valtype(resolve, payload)?;
+        let (index, encoder) = self.defined_type();
+        encoder.stream(ty);
+        Ok(ComponentValType::Type(index))
+    }
+
+    fn encode_error(&mut self) -> Result<ComponentValType> {
+        let (index, encoder) = self.defined_type();
+        encoder.error();
+        Ok(ComponentValType::Type(index))
+    }
 }
 
 pub struct RootTypeEncoder<'state, 'a> {
@@ -425,5 +450,14 @@ impl<'a> ValtypeEncoder<'a> for InstanceTypeEncoder<'_, 'a> {
     }
     fn func_type_map(&mut self) -> &mut HashMap<FunctionKey<'a>, u32> {
         &mut self.func_type_map
+    }
+}
+
+pub fn dealias(resolve: &Resolve, mut id: TypeId) -> TypeId {
+    loop {
+        match &resolve.types[id].kind {
+            TypeDefKind::Type(Type::Id(that_id)) => id = *that_id,
+            _ => break id,
+        }
     }
 }

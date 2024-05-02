@@ -57,7 +57,8 @@ impl LiveTypes {
             TypeDefKind::Type(t)
             | TypeDefKind::List(t)
             | TypeDefKind::Option(t)
-            | TypeDefKind::Future(Some(t)) => self.add_type(resolve, t),
+            | TypeDefKind::Future(Some(t))
+            | TypeDefKind::Stream(t) => self.add_type(resolve, t),
             TypeDefKind::Handle(handle) => match handle {
                 crate::Handle::Own(ty) => self.add_type_id(resolve, *ty),
                 crate::Handle::Borrow(ty) => self.add_type_id(resolve, *ty),
@@ -88,15 +89,10 @@ impl LiveTypes {
                     self.add_type(resolve, ty);
                 }
             }
-            TypeDefKind::Stream(s) => {
-                if let Some(ty) = &s.element {
-                    self.add_type(resolve, ty);
-                }
-                if let Some(ty) = &s.end {
-                    self.add_type(resolve, ty);
-                }
-            }
-            TypeDefKind::Flags(_) | TypeDefKind::Enum(_) | TypeDefKind::Future(None) => {}
+            TypeDefKind::Error
+            | TypeDefKind::Flags(_)
+            | TypeDefKind::Enum(_)
+            | TypeDefKind::Future(None) => {}
             TypeDefKind::Unknown => unreachable!(),
         }
         assert!(self.set.insert(ty));

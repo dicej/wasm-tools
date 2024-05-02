@@ -413,9 +413,18 @@ impl<'a> Dump<'a> {
                             | CanonicalFunction::ResourceDrop { .. }
                             | CanonicalFunction::ResourceRep { .. }
                             | CanonicalFunction::AsyncStart { .. }
-                            | CanonicalFunction::AsyncReturn { .. } => {
-                                ("core func", &mut i.core_funcs)
-                            }
+                            | CanonicalFunction::AsyncReturn { .. }
+                            | CanonicalFunction::FutureNew { .. }
+                            | CanonicalFunction::FutureSend { .. }
+                            | CanonicalFunction::FutureReceive { .. }
+                            | CanonicalFunction::FutureDropSender { .. }
+                            | CanonicalFunction::FutureDropReceiver { .. }
+                            | CanonicalFunction::StreamNew { .. }
+                            | CanonicalFunction::StreamSend { .. }
+                            | CanonicalFunction::StreamReceive { .. }
+                            | CanonicalFunction::StreamDropSender { .. }
+                            | CanonicalFunction::StreamDropReceiver { .. }
+                            | CanonicalFunction::ErrorDrop => ("core func", &mut i.core_funcs),
                         };
 
                         write!(me.state, "[{} {}] {:?}", name, inc(col), f)?;

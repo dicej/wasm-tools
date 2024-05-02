@@ -1214,6 +1214,37 @@ impl Validator {
                     crate::CanonicalFunction::AsyncReturn {
                         component_type_index,
                     } => current.async_return(component_type_index, types, offset),
+                    crate::CanonicalFunction::FutureNew { ty, memory } => {
+                        current.future_new(ty, memory, types, offset)
+                    }
+                    crate::CanonicalFunction::FutureSend { ty, options } => {
+                        current.future_send(ty, options.into_vec(), types, offset)
+                    }
+                    crate::CanonicalFunction::FutureReceive { ty, options } => {
+                        current.future_receive(ty, options.into_vec(), types, offset)
+                    }
+                    crate::CanonicalFunction::FutureDropSender { ty } => {
+                        current.future_drop_sender(ty, types, offset)
+                    }
+                    crate::CanonicalFunction::FutureDropReceiver { ty } => {
+                        current.future_drop_receiver(ty, types, offset)
+                    }
+                    crate::CanonicalFunction::StreamNew { ty, memory } => {
+                        current.stream_new(ty, memory, types, offset)
+                    }
+                    crate::CanonicalFunction::StreamSend { ty, options } => {
+                        current.stream_send(ty, options.into_vec(), types, offset)
+                    }
+                    crate::CanonicalFunction::StreamReceive { ty, options } => {
+                        current.stream_receive(ty, options.into_vec(), types, offset)
+                    }
+                    crate::CanonicalFunction::StreamDropSender { ty } => {
+                        current.stream_drop_sender(ty, types, offset)
+                    }
+                    crate::CanonicalFunction::StreamDropReceiver { ty } => {
+                        current.stream_drop_receiver(ty, types, offset)
+                    }
+                    crate::CanonicalFunction::ErrorDrop => current.error_drop(types, offset),
                 }
             },
         )

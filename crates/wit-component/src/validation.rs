@@ -91,6 +91,11 @@ pub struct ValidatedModule<'a> {
 
     pub required_async_funcs: IndexMap<String, IndexMap<String, AsyncExportInfo<'a>>>,
 
+    pub required_payload_funcs:
+        IndexMap<(String, bool), IndexMap<(String, usize), PayloadInfo<'a>>>,
+
+    pub needs_error_drop: bool,
+
     /// Whether or not this module exported a linear memory.
     pub has_memory: bool,
 
@@ -133,6 +138,22 @@ pub struct AsyncExportInfo<'a> {
     pub return_import: Option<String>,
 }
 
+pub struct PayloadInfo<'a> {
+    pub interface: Option<InterfaceId>,
+    pub function: &'a Function,
+    pub ty: TypeId,
+    pub future_new: Option<String>,
+    pub future_send: Option<String>,
+    pub future_receive: Option<String>,
+    pub future_drop_sender: Option<String>,
+    pub future_drop_receiver: Option<String>,
+    pub stream_new: Option<String>,
+    pub stream_send: Option<String>,
+    pub stream_receive: Option<String>,
+    pub stream_drop_sender: Option<String>,
+    pub stream_drop_receiver: Option<String>,
+}
+
 /// This function validates the following:
 ///
 /// * The `bytes` represent a valid core WebAssembly module.
@@ -157,12 +178,14 @@ pub fn validate_module<'a>(
     let mut ret = ValidatedModule {
         required_imports: Default::default(),
         adapters_required: Default::default(),
+        needs_error_drop: false,
         has_memory: false,
         realloc: None,
         adapter_realloc: None,
         metadata: &metadata.metadata,
         required_async_funcs: Default::default(),
         required_resource_funcs: Default::default(),
+        required_payload_funcs: Default::default(),
         post_returns: Default::default(),
         callbacks: Default::default(),
     };
@@ -231,20 +254,33 @@ pub fn validate_module<'a>(
     let types = types.unwrap();
     let world = &metadata.resolve.worlds[metadata.world];
     let mut exported_resource_and_async_funcs = Vec::new();
+    let mut payload_funcs = Vec::new();
 
     for (name, funcs) in &import_funcs {
         // An empty module name is indicative of the top-level import namespace,
         // so look for top-level functions here.
         if *name == BARE_FUNC_MODULE_NAME {
-            let required =
+            let (required, needs_error_drop) =
                 validate_imports_top_level(&metadata.resolve, metadata.world, funcs, &types)?;
-            let prev = ret.required_imports.insert(BARE_FUNC_MODULE_NAME, required);
-            assert!(prev.is_none());
+            ret.needs_error_drop = needs_error_drop;
+            if !(required.funcs.is_empty() && required.resources.is_empty()) {
+                let prev = ret.required_imports.insert(BARE_FUNC_MODULE_NAME, required);
+                assert!(prev.is_none());
+            }
             continue;
         }
 
         if let Some(interface_name) = name.strip_prefix("[export]") {
             exported_resource_and_async_funcs.push((name, interface_name, &import_funcs[name]));
+            continue;
+        }
+
+        if let Some((interface_name, imported)) = name
+            .strip_prefix("[import-payload]")
+            .map(|v| (v, true))
+            .or_else(|| name.strip_prefix("[export-payload]").map(|v| (v, false)))
+        {
+            payload_funcs.push((name, imported, interface_name, &import_funcs[name]));
             continue;
         }
 
@@ -263,6 +299,7 @@ pub fn validate_module<'a>(
                         name,
                         funcs,
                         &types,
+                        &mut ret.required_payload_funcs,
                     )
                     .with_context(|| format!("failed to validate import interface `{name}`"))?;
                     let prev = ret.required_imports.insert(name, required);
@@ -285,6 +322,7 @@ pub fn validate_module<'a>(
             &types,
             &mut ret.post_returns,
             &mut ret.callbacks,
+            &mut ret.required_payload_funcs,
             &mut ret.required_async_funcs,
             &mut ret.required_resource_funcs,
         )?;
@@ -308,6 +346,29 @@ pub fn validate_module<'a>(
         }
     }
 
+    for (name, imported, interface_name, funcs) in payload_funcs {
+        let world_key = world_key(&metadata.resolve, interface_name);
+        let (item, direction) = if imported {
+            (world.imports.get(&world_key), "imported")
+        } else {
+            (world.exports.get(&world_key), "exported")
+        };
+        match item {
+            Some(WorldItem::Interface(i)) => {
+                validate_payload_imports(
+                    &metadata.resolve,
+                    *i,
+                    name,
+                    imported,
+                    funcs,
+                    &types,
+                    &mut ret.required_payload_funcs,
+                )?;
+            }
+            _ => bail!("import from `{name}` does not correspond to {direction} interface"),
+        }
+    }
+
     Ok(ret)
 }
 
@@ -324,8 +385,9 @@ fn validate_exported_interface_resource_and_async_imports<'a, 'b>(
         Some(ty) => matches!(resolve.types[*ty].kind, TypeDefKind::Resource),
         None => false,
     };
+    let mut async_module = required_async_funcs.get_mut(import_module);
     for (func_name, ty) in funcs {
-        if let Some(info) = required_async_funcs.get_mut(import_module) {
+        if let Some(ref mut info) = async_module {
             if let Some(function_name) = func_name.strip_prefix(ASYNC_START) {
                 info[function_name].start_import = Some(func_name.to_string());
                 continue;
@@ -358,6 +420,69 @@ fn validate_exported_interface_resource_and_async_imports<'a, 'b>(
     Ok(())
 }
 
+fn match_payload_prefix(name: &str, prefix: &str) -> Option<(String, usize)> {
+    let suffix = name.strip_prefix(prefix)?;
+    let index = suffix.find(']')?;
+    Some((
+        suffix[index + 1..].to_owned(),
+        suffix[..index].parse().ok()?,
+    ))
+}
+
+fn validate_payload_imports<'a, 'b>(
+    _resolve: &'b Resolve,
+    _interface: InterfaceId,
+    module: &str,
+    import: bool,
+    funcs: &IndexMap<&'a str, u32>,
+    _types: &Types,
+    required_payload_funcs: &mut IndexMap<
+        (String, bool),
+        IndexMap<(String, usize), PayloadInfo<'b>>,
+    >,
+) -> Result<()> {
+    // TODO: Verify that the core wasm function signatures match what we expect for each function found below.
+    // Presumably any issues will be caught anyway when the final component is validated, but it would be best to
+    // catch them early.
+    let module = module
+        .strip_prefix(if import {
+            "[import-payload]"
+        } else {
+            "[export-payload]"
+        })
+        .unwrap();
+    let info = &mut required_payload_funcs[&(module.to_owned(), import)];
+    for (orig_func_name, _ty) in funcs {
+        let func_name = orig_func_name
+            .strip_prefix("[async]")
+            .unwrap_or(orig_func_name);
+        if let Some(key) = match_payload_prefix(func_name, "[future-new-") {
+            info[&key].future_new = Some(orig_func_name.to_string());
+        } else if let Some(key) = match_payload_prefix(func_name, "[future-send-") {
+            info[&key].future_send = Some(orig_func_name.to_string());
+        } else if let Some(key) = match_payload_prefix(func_name, "[future-receive-") {
+            info[&key].future_receive = Some(orig_func_name.to_string());
+        } else if let Some(key) = match_payload_prefix(func_name, "[future-drop-sender-") {
+            info[&key].future_drop_sender = Some(orig_func_name.to_string());
+        } else if let Some(key) = match_payload_prefix(func_name, "[future-drop-receiver-") {
+            info[&key].future_drop_receiver = Some(orig_func_name.to_string());
+        } else if let Some(key) = match_payload_prefix(func_name, "[stream-new-") {
+            info[&key].stream_new = Some(orig_func_name.to_string());
+        } else if let Some(key) = match_payload_prefix(func_name, "[stream-send-") {
+            info[&key].stream_send = Some(orig_func_name.to_string());
+        } else if let Some(key) = match_payload_prefix(func_name, "[stream-receive-") {
+            info[&key].stream_receive = Some(orig_func_name.to_string());
+        } else if let Some(key) = match_payload_prefix(func_name, "[stream-drop-sender-") {
+            info[&key].stream_drop_sender = Some(orig_func_name.to_string());
+        } else if let Some(key) = match_payload_prefix(func_name, "[stream-drop-receiver-") {
+            info[&key].stream_drop_receiver = Some(orig_func_name.to_string());
+        } else {
+            bail!("unrecognized payload import: {orig_func_name}");
+        }
+    }
+    Ok(())
+}
+
 /// Validation information from an "adapter module" which is distinct from a
 /// "main module" validated above.
 ///
@@ -378,6 +503,11 @@ pub struct ValidatedAdapter<'a> {
     pub required_resource_funcs: IndexMap<String, IndexMap<String, ResourceInfo>>,
 
     pub required_async_funcs: IndexMap<String, IndexMap<String, AsyncExportInfo<'a>>>,
+
+    pub required_payload_funcs:
+        IndexMap<(String, bool), IndexMap<(String, usize), PayloadInfo<'a>>>,
+
+    pub needs_error_drop: bool,
 
     /// This is the module and field name of the memory import, if one is
     /// specified.
@@ -446,6 +576,8 @@ pub fn validate_adapter_module<'a>(
         required_imports: Default::default(),
         required_resource_funcs: Default::default(),
         required_async_funcs: Default::default(),
+        required_payload_funcs: Default::default(),
+        needs_error_drop: false,
         needs_memory: None,
         needs_core_exports: Default::default(),
         import_realloc: None,
@@ -544,7 +676,9 @@ pub fn validate_adapter_module<'a>(
     }
 
     let types = types.unwrap();
-    let mut exported_resource_funcs = Vec::new();
+    let mut exported_resource_and_async_funcs = Vec::new();
+    let mut payload_funcs = Vec::new();
+
     for (name, funcs) in &import_funcs {
         if *name == MAIN_MODULE_IMPORT_NAME {
             ret.needs_core_exports
@@ -555,25 +689,44 @@ pub fn validate_adapter_module<'a>(
         // An empty module name is indicative of the top-level import namespace,
         // so look for top-level functions here.
         if *name == BARE_FUNC_MODULE_NAME {
-            let required = validate_imports_top_level(resolve, world, funcs, &types)?;
-            ret.required_imports
-                .insert(BARE_FUNC_MODULE_NAME.to_string(), required);
+            let (required, needs_error_drop) =
+                validate_imports_top_level(resolve, world, funcs, &types)?;
+            ret.needs_error_drop = needs_error_drop;
+            if !(required.funcs.is_empty() && required.resources.is_empty()) {
+                let prev = ret
+                    .required_imports
+                    .insert(BARE_FUNC_MODULE_NAME.to_string(), required);
+                assert!(prev.is_none());
+            }
             continue;
         }
 
         if let Some(interface_name) = name.strip_prefix("[export]") {
-            exported_resource_funcs.push((name, interface_name, &import_funcs[name]));
+            exported_resource_and_async_funcs.push((name, interface_name, &import_funcs[name]));
+            continue;
+        }
+
+        if let Some((interface_name, imported)) = name
+            .strip_prefix("[import-payload]")
+            .map(|v| (v, true))
+            .or_else(|| name.strip_prefix("[export-payload]").map(|v| (v, false)))
+        {
+            payload_funcs.push((name, imported, interface_name, &import_funcs[name]));
             continue;
         }
 
         if !(is_library && adapters.contains(name)) {
             match resolve.worlds[world].imports.get(&world_key(resolve, name)) {
                 Some(WorldItem::Interface(interface)) => {
-                    let required =
-                        validate_imported_interface(resolve, *interface, name, funcs, &types)
-                            .with_context(|| {
-                                format!("failed to validate import interface `{name}`")
-                            })?;
+                    let required = validate_imported_interface(
+                        resolve,
+                        *interface,
+                        name,
+                        funcs,
+                        &types,
+                        &mut ret.required_payload_funcs,
+                    )
+                    .with_context(|| format!("failed to validate import interface `{name}`"))?;
                     let prev = ret.required_imports.insert(name.to_string(), required);
                     assert!(prev.is_none());
                 }
@@ -612,12 +765,13 @@ pub fn validate_adapter_module<'a>(
             &types,
             &mut ret.post_returns,
             &mut ret.callbacks,
+            &mut ret.required_payload_funcs,
             &mut ret.required_async_funcs,
             &mut ret.required_resource_funcs,
         )?;
     }
 
-    for (name, interface_name, funcs) in exported_resource_funcs {
+    for (name, interface_name, funcs) in exported_resource_and_async_funcs {
         let world_key = world_key(resolve, interface_name);
         match world.exports.get(&world_key) {
             Some(WorldItem::Interface(i)) => {
@@ -632,6 +786,29 @@ pub fn validate_adapter_module<'a>(
                 )?;
             }
             _ => bail!("import from `{name}` does not correspond to exported interface"),
+        }
+    }
+
+    for (name, imported, interface_name, funcs) in payload_funcs {
+        let world_key = world_key(resolve, interface_name);
+        let (item, direction) = if imported {
+            (world.imports.get(&world_key), "imported")
+        } else {
+            (world.exports.get(&world_key), "exported")
+        };
+        match item {
+            Some(WorldItem::Interface(i)) => {
+                validate_payload_imports(
+                    resolve,
+                    *i,
+                    name,
+                    imported,
+                    funcs,
+                    &types,
+                    &mut ret.required_payload_funcs,
+                )?;
+            }
+            _ => bail!("import from `{name}` does not correspond to {direction} interface"),
         }
     }
 
@@ -666,7 +843,8 @@ fn validate_imports_top_level(
     world: WorldId,
     funcs: &IndexMap<&str, u32>,
     types: &Types,
-) -> Result<RequiredImports> {
+) -> Result<(RequiredImports, bool)> {
+    // TODO: handle top-level required async, future, and stream built-in imports here
     let is_resource = |name: &str| match resolve.worlds[world]
         .imports
         .get(&WorldKey::Name(name.to_string()))
@@ -677,8 +855,14 @@ fn validate_imports_top_level(
         _ => false,
     };
     let mut required = RequiredImports::default();
+    let mut needs_error_drop = false;
     for (name, ty) in funcs {
         {
+            if *name == "[error-drop]" {
+                needs_error_drop = true;
+                continue;
+            }
+
             let (abi, name) = if let Some(name) = name.strip_prefix("[async]") {
                 (AbiVariant::GuestImportAsync, name)
             } else {
@@ -700,7 +884,7 @@ fn validate_imports_top_level(
         }
         required.funcs.insert(name.to_string());
     }
-    Ok(required)
+    Ok((required, needs_error_drop))
 }
 
 fn valid_imported_resource_func<'a>(
@@ -743,12 +927,45 @@ fn valid_exported_resource_func<'a>(
     Ok(None)
 }
 
-fn validate_imported_interface(
-    resolve: &Resolve,
+fn find_payloads<'a>(
+    resolve: &'a Resolve,
+    interface: Option<InterfaceId>,
+    function: &'a Function,
+    payload_map: &mut IndexMap<(String, usize), PayloadInfo<'a>>,
+) {
+    let types = function.find_futures_and_streams(resolve);
+    for (index, ty) in types.iter().enumerate() {
+        payload_map.insert(
+            (function.name.clone(), index),
+            PayloadInfo {
+                interface,
+                function,
+                ty: *ty,
+                future_new: None,
+                future_send: None,
+                future_receive: None,
+                future_drop_sender: None,
+                future_drop_receiver: None,
+                stream_new: None,
+                stream_send: None,
+                stream_receive: None,
+                stream_drop_sender: None,
+                stream_drop_receiver: None,
+            },
+        );
+    }
+}
+
+fn validate_imported_interface<'a>(
+    resolve: &'a Resolve,
     interface: InterfaceId,
     name: &str,
     imports: &IndexMap<&str, u32>,
     types: &Types,
+    required_payload_funcs: &mut IndexMap<
+        (String, bool),
+        IndexMap<(String, usize), PayloadInfo<'a>>,
+    >,
 ) -> Result<RequiredImports> {
     let mut required = RequiredImports::default();
     let is_resource = |name: &str| {
@@ -769,6 +986,14 @@ fn validate_imported_interface(
                 Some(f) => {
                     let ty = types[types.core_type_at(*ty).unwrap_sub()].unwrap_func();
                     validate_func(resolve, ty, f, abi)?;
+                    find_payloads(
+                        resolve,
+                        Some(interface),
+                        f,
+                        required_payload_funcs
+                            .entry((name.to_string(), true))
+                            .or_default(),
+                    );
                 }
                 None => match valid_imported_resource_func(func_name, *ty, types, is_resource)? {
                     Some(name) => {
@@ -850,13 +1075,18 @@ fn validate_exported_item<'a>(
     types: &Types,
     post_returns: &mut IndexSet<String>,
     callbacks: &mut IndexSet<String>,
+    required_payload_funcs: &mut IndexMap<
+        (String, bool),
+        IndexMap<(String, usize), PayloadInfo<'a>>,
+    >,
     required_async_funcs: &mut IndexMap<String, IndexMap<String, AsyncExportInfo<'a>>>,
     required_resource_funcs: &mut IndexMap<String, IndexMap<String, ResourceInfo>>,
 ) -> Result<()> {
     let mut validate =
         |func: &'a Function,
          interface: Option<(&str, InterfaceId)>,
-         async_map: &mut IndexMap<String, AsyncExportInfo<'a>>| {
+         async_map: &mut IndexMap<String, AsyncExportInfo<'a>>,
+         payload_map: &mut IndexMap<(String, usize), PayloadInfo<'a>>| {
             let expected_export_name = func.core_export_name(interface.map(|(n, _)| n));
             let (abi, func_index) = match exports.get(expected_export_name.as_ref()) {
                 Some(func_index) => (AbiVariant::GuestExport, func_index),
@@ -883,6 +1113,7 @@ fn validate_exported_item<'a>(
             let id = types.core_function_at(*func_index);
             let ty = types[id].unwrap_func();
             validate_func(resolve, ty, func, abi)?;
+            find_payloads(resolve, interface.map(|(_, id)| id), func, payload_map);
 
             let post_return = format!("{POST_RETURN_PREFIX}{expected_export_name}");
             if let Some(index) = exports.get(&post_return[..]) {
@@ -912,14 +1143,25 @@ fn validate_exported_item<'a>(
             required_async_funcs
                 .entry(format!("[export]{BARE_FUNC_MODULE_NAME}"))
                 .or_default(),
+            required_payload_funcs
+                .entry((BARE_FUNC_MODULE_NAME.to_string(), false))
+                .or_default(),
         )?,
         WorldItem::Interface(interface_id) => {
             let interface = &resolve.interfaces[*interface_id];
             let mut async_map = IndexMap::new();
             for (_, f) in interface.functions.iter() {
-                validate(f, Some((export_name, *interface_id)), &mut async_map).with_context(
-                    || format!("failed to validate exported interface `{export_name}`"),
-                )?;
+                validate(
+                    f,
+                    Some((export_name, *interface_id)),
+                    &mut async_map,
+                    required_payload_funcs
+                        .entry((export_name.to_string(), false))
+                        .or_default(),
+                )
+                .with_context(|| {
+                    format!("failed to validate exported interface `{export_name}`")
+                })?;
             }
             let prev = required_async_funcs.insert(format!("[export]{export_name}"), async_map);
             assert!(prev.is_none());

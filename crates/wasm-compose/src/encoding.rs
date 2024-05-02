@@ -678,6 +678,9 @@ impl<'a> TypeEncoder<'a> {
                 state.cur.encodable.ty().defined_type().borrow(ty);
                 index
             }
+            wasmparser::types::ComponentDefinedType::Future(ty) => self.future(state, *ty),
+            wasmparser::types::ComponentDefinedType::Stream(ty) => self.stream(state, *ty),
+            wasmparser::types::ComponentDefinedType::Error => self.error(state),
         }
     }
 
@@ -792,6 +795,32 @@ impl<'a> TypeEncoder<'a> {
             state.cur.add_type_export(key, name);
         }
         export
+    }
+
+    fn future(
+        &self,
+        state: &mut TypeState<'a>,
+        ty: Option<wasmparser::types::ComponentValType>,
+    ) -> u32 {
+        let ty = ty.map(|ty| self.component_val_type(state, ty));
+
+        let index = state.cur.encodable.type_count();
+        state.cur.encodable.ty().defined_type().future(ty);
+        index
+    }
+
+    fn stream(&self, state: &mut TypeState<'a>, ty: wasmparser::types::ComponentValType) -> u32 {
+        let ty = self.component_val_type(state, ty);
+
+        let index = state.cur.encodable.type_count();
+        state.cur.encodable.ty().defined_type().stream(ty);
+        index
+    }
+
+    fn error(&self, state: &mut TypeState<'a>) -> u32 {
+        let index = state.cur.encodable.type_count();
+        state.cur.encodable.ty().defined_type().error();
+        index
     }
 }
 
@@ -1220,10 +1249,11 @@ impl DependencyRegistrar<'_, '_> {
         match &self.types[ty] {
             types::ComponentDefinedType::Primitive(_)
             | types::ComponentDefinedType::Enum(_)
-            | types::ComponentDefinedType::Flags(_) => {}
-            types::ComponentDefinedType::List(t) | types::ComponentDefinedType::Option(t) => {
-                self.val_type(*t)
-            }
+            | types::ComponentDefinedType::Flags(_)
+            | types::ComponentDefinedType::Error => {}
+            types::ComponentDefinedType::List(t)
+            | types::ComponentDefinedType::Option(t)
+            | types::ComponentDefinedType::Stream(t) => self.val_type(*t),
             types::ComponentDefinedType::Own(r) | types::ComponentDefinedType::Borrow(r) => {
                 self.ty(ComponentAnyTypeId::Resource(*r))
             }
@@ -1250,6 +1280,11 @@ impl DependencyRegistrar<'_, '_> {
                 }
                 if let Some(err) = err {
                     self.val_type(*err);
+                }
+            }
+            types::ComponentDefinedType::Future(ty) => {
+                if let Some(ty) = ty {
+                    self.val_type(*ty);
                 }
             }
         }
