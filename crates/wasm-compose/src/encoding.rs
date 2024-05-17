@@ -599,6 +599,17 @@ impl<'a> TypeEncoder<'a> {
                 return ret;
             }
 
+            if let Some((instance, name)) = state.cur.instance_exports.get(&key) {
+                let ret = state.cur.encodable.type_count();
+                state.cur.encodable.alias(Alias::InstanceExport {
+                    instance: *instance,
+                    name,
+                    kind: ComponentExportKind::Type,
+                });
+                log::trace!("id defined in current instance");
+                return ret;
+            }
+
             match id.peel_alias(&self.0.types) {
                 Some(next) => id = next,
                 // If there's no more aliases then fall through to the
@@ -611,15 +622,17 @@ impl<'a> TypeEncoder<'a> {
         return match id {
             AnyTypeId::Core(ComponentCoreTypeId::Sub(_)) => unreachable!(),
             AnyTypeId::Core(ComponentCoreTypeId::Module(id)) => self.module_type(state, id),
-            AnyTypeId::Component(id) => match id {
-                ComponentAnyTypeId::Resource(_) => {
-                    unreachable!("should have been handled in `TypeEncoder::component_entity_type`")
+            AnyTypeId::Component(id) => {
+                match id {
+                    ComponentAnyTypeId::Resource(r) => {
+                        unreachable!("should have been handled in `TypeEncoder::component_entity_type`: {r:?}")
+                    }
+                    ComponentAnyTypeId::Defined(id) => self.defined_type(state, id),
+                    ComponentAnyTypeId::Func(id) => self.component_func_type(state, id),
+                    ComponentAnyTypeId::Instance(id) => self.component_instance_type(state, id),
+                    ComponentAnyTypeId::Component(id) => self.component_type(state, id),
                 }
-                ComponentAnyTypeId::Defined(id) => self.defined_type(state, id),
-                ComponentAnyTypeId::Func(id) => self.component_func_type(state, id),
-                ComponentAnyTypeId::Instance(id) => self.component_instance_type(state, id),
-                ComponentAnyTypeId::Component(id) => self.component_type(state, id),
-            },
+            }
         };
     }
 
@@ -1444,7 +1457,7 @@ impl<'a> CompositionGraphEncoder<'a> {
         state.push(Encodable::Instance(InstanceType::new()));
         for (name, types) in exports {
             let (component, ty) = types[0];
-            log::trace!("export {name}");
+            log::trace!("export {name}: {ty:?}");
             let export = TypeEncoder::new(component).export(name, ty, state);
             let t = match &mut state.cur.encodable {
                 Encodable::Instance(c) => c,
@@ -1460,6 +1473,7 @@ impl<'a> CompositionGraphEncoder<'a> {
                 }
             }
         }
+
         let instance_type = match state.pop() {
             Encodable::Instance(c) => c,
             _ => unreachable!(),

@@ -495,8 +495,6 @@ impl<'a> CompositionGraphBuilder<'a> {
             }
         }
 
-        self.graph.unify_imported_resources();
-
         Ok((self.instances[root_instance], self.graph))
     }
 }
