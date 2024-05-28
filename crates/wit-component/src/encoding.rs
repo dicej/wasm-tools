@@ -637,6 +637,21 @@ impl<'a> EncodingState<'a> {
             args.push(("$root".to_owned(), ModuleArg::Instance(index)));
         }
 
+        if info.needs_task_wait {
+            let index = self.component.core_alias_export(
+                self.shim_instance_index
+                    .expect("shim should be instantiated"),
+                &shims.shim_names[&ShimKind::TaskWait],
+                ExportKind::Func,
+            );
+            let index = self.component.core_instantiate_exports(vec![(
+                "[task-wait]",
+                ExportKind::Func,
+                index,
+            )]);
+            args.push(("$root".to_owned(), ModuleArg::Instance(index)));
+        }
+
         // Instantiate the main module now that all of its arguments have been
         // prepared. With this we now have the main linear memory for
         // liftings/lowerings later on as well as the adapter modules, if any,
@@ -1282,6 +1297,23 @@ impl<'a> EncodingState<'a> {
                 &mut ret,
             )?;
 
+            if adapter.info.needs_task_wait {
+                let name = ret.list.len().to_string();
+                let debug_name = format!("task.wait");
+                signatures.push(WasmSignature {
+                    params: vec![WasmType::I32],
+                    results: vec![WasmType::I32],
+                    indirect_params: false,
+                    retptr: false,
+                });
+                ret.list.push(Shim {
+                    name,
+                    debug_name,
+                    options: RequiredOptions::empty(),
+                    kind: ShimKind::TaskWait,
+                });
+            }
+
             let funcs = match self.info.info.adapters_required.get(adapter_name) {
                 Some(funcs) => funcs,
                 None => continue,
@@ -1323,6 +1355,23 @@ impl<'a> EncodingState<'a> {
             &mut signatures,
             &mut ret,
         )?;
+
+        if info.needs_task_wait {
+            let name = ret.list.len().to_string();
+            let debug_name = format!("task.wait");
+            signatures.push(WasmSignature {
+                params: vec![WasmType::I32],
+                results: vec![WasmType::I32],
+                indirect_params: false,
+                retptr: false,
+            });
+            ret.list.push(Shim {
+                name,
+                debug_name,
+                options: RequiredOptions::empty(),
+                kind: ShimKind::TaskWait,
+            });
+        }
 
         if ret.list.is_empty() {
             return Ok(ret);
@@ -1665,6 +1714,8 @@ impl<'a> EncodingState<'a> {
                         }
                     }
                 }
+
+                ShimKind::TaskWait => self.component.task_wait(self.memory_index.unwrap()),
             };
 
             exports.push((shim.name.as_str(), ExportKind::Func, core_func_index));
@@ -2199,6 +2250,21 @@ impl<'a> EncodingState<'a> {
             args.push(("$root".to_owned(), ModuleArg::Instance(index)));
         }
 
+        if adapter.info.needs_task_wait {
+            let index = self.component.core_alias_export(
+                self.shim_instance_index
+                    .expect("shim should be instantiated"),
+                &shims.shim_names[&ShimKind::TaskWait],
+                ExportKind::Func,
+            );
+            let index = self.component.core_instantiate_exports(vec![(
+                "[task-wait]",
+                ExportKind::Func,
+                index,
+            )]);
+            args.push(("$root".to_owned(), ModuleArg::Instance(index)));
+        }
+
         let instance = self.component.core_instantiate(
             self.adapter_modules[name],
             args.iter().map(|(a, b)| (a.as_str(), *b)),
@@ -2313,6 +2379,7 @@ enum ShimKind<'a> {
         ordinal: usize,
         kind: PayloadFuncKind,
     },
+    TaskWait,
 }
 
 /// Indicator for which module is being used for a lowering or where options

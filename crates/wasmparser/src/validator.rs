@@ -1245,6 +1245,9 @@ impl Validator {
                         current.stream_drop_receiver(ty, types, offset)
                     }
                     crate::CanonicalFunction::ErrorDrop => current.error_drop(types, offset),
+                    crate::CanonicalFunction::TaskWait { memory } => {
+                        current.task_wait(memory, types, offset)
+                    }
                 }
             },
         )

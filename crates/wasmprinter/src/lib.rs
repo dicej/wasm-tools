@@ -2505,7 +2505,17 @@ impl Printer {
                     self.start_group("core func ");
                     self.print_name(&state.core.func_names, state.core.funcs)?;
                     self.result.push(' ');
-                    self.start_group("canon stream.drop_receiver");
+                    self.start_group("canon error.drop");
+                    self.end_group();
+                    self.end_group();
+                    state.core.funcs += 1;
+                }
+                CanonicalFunction::TaskWait { memory } => {
+                    self.start_group("core func ");
+                    self.print_name(&state.core.func_names, state.core.funcs)?;
+                    self.result.push(' ');
+                    self.start_group("canon task.wait ");
+                    self.print_idx(&state.component.type_names, memory)?;
                     self.end_group();
                     self.end_group();
                     state.core.funcs += 1;

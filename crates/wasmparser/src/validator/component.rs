@@ -1415,6 +1415,22 @@ impl ComponentState {
         Ok(())
     }
 
+    pub fn task_wait(&mut self, memory: u32, types: &mut TypeAlloc, offset: usize) -> Result<()> {
+        self.memory_at(memory, offset)?;
+
+        let (_is_new, group_id) = types.intern_canonical_rec_group(RecGroup::implicit(
+            offset,
+            SubType {
+                is_final: true,
+                supertype_idx: None,
+                composite_type: CompositeType::Func(FuncType::new([ValType::I32], [ValType::I32])),
+            },
+        ));
+        let id = types[group_id].start;
+        self.core_funcs.push(id);
+        Ok(())
+    }
+
     fn check_local_resource(&self, idx: u32, types: &TypeList, offset: usize) -> Result<ValType> {
         let resource = self.resource_at(idx, types, offset)?;
         match self

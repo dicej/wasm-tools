@@ -95,6 +95,7 @@ pub struct ValidatedModule<'a> {
         IndexMap<(String, bool), IndexMap<(String, usize), PayloadInfo<'a>>>,
 
     pub needs_error_drop: bool,
+    pub needs_task_wait: bool,
 
     /// Whether or not this module exported a linear memory.
     pub has_memory: bool,
@@ -179,6 +180,7 @@ pub fn validate_module<'a>(
         required_imports: Default::default(),
         adapters_required: Default::default(),
         needs_error_drop: false,
+        needs_task_wait: false,
         has_memory: false,
         realloc: None,
         adapter_realloc: None,
@@ -260,9 +262,13 @@ pub fn validate_module<'a>(
         // An empty module name is indicative of the top-level import namespace,
         // so look for top-level functions here.
         if *name == BARE_FUNC_MODULE_NAME {
-            let (required, needs_error_drop) =
-                validate_imports_top_level(&metadata.resolve, metadata.world, funcs, &types)?;
+            let Imports {
+                required,
+                needs_error_drop,
+                needs_task_wait,
+            } = validate_imports_top_level(&metadata.resolve, metadata.world, funcs, &types)?;
             ret.needs_error_drop = needs_error_drop;
+            ret.needs_task_wait = needs_task_wait;
             if !(required.funcs.is_empty() && required.resources.is_empty()) {
                 let prev = ret.required_imports.insert(BARE_FUNC_MODULE_NAME, required);
                 assert!(prev.is_none());
@@ -508,6 +514,7 @@ pub struct ValidatedAdapter<'a> {
         IndexMap<(String, bool), IndexMap<(String, usize), PayloadInfo<'a>>>,
 
     pub needs_error_drop: bool,
+    pub needs_task_wait: bool,
 
     /// This is the module and field name of the memory import, if one is
     /// specified.
@@ -578,6 +585,7 @@ pub fn validate_adapter_module<'a>(
         required_async_funcs: Default::default(),
         required_payload_funcs: Default::default(),
         needs_error_drop: false,
+        needs_task_wait: false,
         needs_memory: None,
         needs_core_exports: Default::default(),
         import_realloc: None,
@@ -689,9 +697,13 @@ pub fn validate_adapter_module<'a>(
         // An empty module name is indicative of the top-level import namespace,
         // so look for top-level functions here.
         if *name == BARE_FUNC_MODULE_NAME {
-            let (required, needs_error_drop) =
-                validate_imports_top_level(resolve, world, funcs, &types)?;
+            let Imports {
+                required,
+                needs_error_drop,
+                needs_task_wait,
+            } = validate_imports_top_level(resolve, world, funcs, &types)?;
             ret.needs_error_drop = needs_error_drop;
+            ret.needs_task_wait = needs_task_wait;
             if !(required.funcs.is_empty() && required.resources.is_empty()) {
                 let prev = ret
                     .required_imports
@@ -838,12 +850,18 @@ fn world_key(resolve: &Resolve, name: &str) -> WorldKey {
     }
 }
 
+struct Imports {
+    required: RequiredImports,
+    needs_error_drop: bool,
+    needs_task_wait: bool,
+}
+
 fn validate_imports_top_level(
     resolve: &Resolve,
     world: WorldId,
     funcs: &IndexMap<&str, u32>,
     types: &Types,
-) -> Result<(RequiredImports, bool)> {
+) -> Result<Imports> {
     // TODO: handle top-level required async, future, and stream built-in imports here
     let is_resource = |name: &str| match resolve.worlds[world]
         .imports
@@ -854,12 +872,20 @@ fn validate_imports_top_level(
         }
         _ => false,
     };
-    let mut required = RequiredImports::default();
-    let mut needs_error_drop = false;
+    let mut imports = Imports {
+        required: RequiredImports::default(),
+        needs_error_drop: false,
+        needs_task_wait: false,
+    };
     for (name, ty) in funcs {
         {
             if *name == "[error-drop]" {
-                needs_error_drop = true;
+                imports.needs_error_drop = true;
+                continue;
+            }
+
+            if *name == "[task-wait]" {
+                imports.needs_task_wait = true;
                 continue;
             }
 
@@ -876,15 +902,15 @@ fn validate_imports_top_level(
                 Some(_) => bail!("expected world top-level import `{name}` to be a function"),
                 None => match valid_imported_resource_func(name, *ty, types, is_resource)? {
                     Some(name) => {
-                        required.resources.insert(name.to_string());
+                        imports.required.resources.insert(name.to_string());
                     }
                     None => bail!("no top-level imported function `{name}` specified"),
                 },
             }
         }
-        required.funcs.insert(name.to_string());
+        imports.required.funcs.insert(name.to_string());
     }
-    Ok((required, needs_error_drop))
+    Ok(imports)
 }
 
 fn valid_imported_resource_func<'a>(

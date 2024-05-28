@@ -296,6 +296,14 @@ impl CanonicalFunctionSection {
         self.num_added += 1;
         self
     }
+
+    /// TODO: docs
+    pub fn task_wait(&mut self, memory: u32) -> &mut Self {
+        self.bytes.push(0x12);
+        memory.encode(&mut self.bytes);
+        self.num_added += 1;
+        self
+    }
 }
 
 impl Encode for CanonicalFunctionSection {

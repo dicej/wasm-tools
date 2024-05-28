@@ -137,6 +137,11 @@ pub enum CanonicalFunction {
     },
     /// TODO: docs
     ErrorDrop,
+    /// TODO: docs
+    TaskWait {
+        /// TODO: docs
+        memory: u32,
+    },
 }
 
 /// A reader for the canonical section of a WebAssembly component.
@@ -221,6 +226,9 @@ impl<'a> FromReader<'a> for CanonicalFunction {
             0x0f => CanonicalFunction::StreamDropSender { ty: reader.read()? },
             0x10 => CanonicalFunction::StreamDropReceiver { ty: reader.read()? },
             0x11 => CanonicalFunction::ErrorDrop,
+            0x12 => CanonicalFunction::TaskWait {
+                memory: reader.read()?,
+            },
             x => return reader.invalid_leading_byte(x, "canonical function"),
         })
     }

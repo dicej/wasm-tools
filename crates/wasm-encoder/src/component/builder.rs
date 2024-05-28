@@ -466,6 +466,12 @@ impl ComponentBuilder {
         inc(&mut self.core_funcs)
     }
 
+    /// TODO: docs
+    pub fn task_wait(&mut self, memory: u32) -> u32 {
+        self.canonical_functions().task_wait(memory);
+        inc(&mut self.core_funcs)
+    }
+
     /// Adds a new custom section to this component.
     pub fn custom_section(&mut self, section: &CustomSection<'_>) {
         self.flush();
