@@ -50,7 +50,7 @@ use wasm_encoder::{
     ComponentBuilder, ComponentExportKind, ComponentType, ComponentTypeRef, CustomSection,
 };
 use wasm_metadata::Producers;
-use wasmparser::{BinaryReader, Parser, Payload};
+use wasmparser::{BinaryReader, Encoding, Parser, Payload, WasmFeatures};
 use wit_parser::{Package, PackageName, Resolve, World, WorldId, WorldItem};
 
 const CURRENT_VERSION: u8 = 0x04;
@@ -92,6 +92,7 @@ impl Default for Bindgen {
             includes: Default::default(),
             include_names: Default::default(),
             package: Some(package),
+            stability: Default::default(),
         });
         resolve.packages[package]
             .worlds
@@ -127,6 +128,8 @@ pub struct ModuleMetadata {
 /// The extraction here provides the metadata necessary to continue the process
 /// later on.
 ///
+/// This will return an error if `wasm` is not a valid WebAssembly module.
+///
 /// Note that a "stripped" binary where `component-type` sections are removed
 /// is returned as well to embed within a component.
 pub fn decode(wasm: &[u8]) -> Result<(Vec<u8>, Bindgen)> {
@@ -141,6 +144,9 @@ pub fn decode(wasm: &[u8]) -> Result<(Vec<u8>, Bindgen)> {
                     .with_context(|| format!("decoding custom section {}", cs.name()))?;
                 ret.merge(data)
                     .with_context(|| format!("updating metadata for section {}", cs.name()))?;
+            }
+            wasmparser::Payload::Version { encoding, .. } if encoding != Encoding::Module => {
+                bail!("decoding a component is not supported")
             }
             _ => {
                 if let Some((id, range)) = payload.as_section() {
@@ -244,7 +250,7 @@ impl Bindgen {
         let resolve;
         let encoding;
 
-        let mut reader = BinaryReader::new(data);
+        let mut reader = BinaryReader::new(data, 0, WasmFeatures::all());
         match reader.read_u8()? {
             // Historical 0x03 format where the support here will be deleted in
             // the future
@@ -253,12 +259,12 @@ impl Bindgen {
                 let world_name = reader.read_string()?;
                 wasm = &data[reader.original_position()..];
 
-                let (r, pkg) = match crate::decode(wasm)? {
-                    DecodedWasm::WitPackage(resolve, pkg) => (resolve, pkg),
-                    DecodedWasm::Component(..) => bail!("expected an encoded wit package"),
+                let (r, pkgs) = match crate::decode(wasm)? {
+                    DecodedWasm::WitPackages(resolve, pkgs) => (resolve, pkgs),
+                    DecodedWasm::Component(..) => bail!("expected encoded wit package(s)"),
                 };
                 resolve = r;
-                world = resolve.packages[pkg].worlds[world_name];
+                world = resolve.select_world(&pkgs, Some(world_name.into()))?;
             }
 
             // Current format where `data` is a wasm component itself.
@@ -301,7 +307,7 @@ impl Bindgen {
             .resolve
             .merge(resolve)
             .context("failed to merge WIT package sets together")?
-            .worlds[world.index()];
+            .map_world(world, None)?;
         self.resolve
             .merge_worlds(world, self.world)
             .context("failed to merge worlds from two documents")?;
@@ -356,8 +362,8 @@ impl ModuleMetadata {
                         .insert((BARE_FUNC_MODULE_NAME.to_string(), name.clone()), encoding);
                     assert!(prev.is_none());
                 }
-                WorldItem::Interface(i) => {
-                    for (func, _) in resolve.interfaces[*i].functions.iter() {
+                WorldItem::Interface { id, .. } => {
+                    for (func, _) in resolve.interfaces[*id].functions.iter() {
                         let prev = ret
                             .import_encodings
                             .insert((name.clone(), func.clone()), encoding);
@@ -376,8 +382,8 @@ impl ModuleMetadata {
                     let prev = ret.export_encodings.insert(name.clone(), encoding);
                     assert!(prev.is_none());
                 }
-                WorldItem::Interface(i) => {
-                    for (_, func) in resolve.interfaces[*i].functions.iter() {
+                WorldItem::Interface { id, .. } => {
+                    for (_, func) in resolve.interfaces[*id].functions.iter() {
                         let name = func.core_export_name(Some(&name)).into_owned();
                         let prev = ret.export_encodings.insert(name, encoding);
                         assert!(prev.is_none());

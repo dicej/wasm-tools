@@ -161,7 +161,6 @@ where
     fn is_subtype(&self, a: ValType, b: ValType) -> bool {
         T::is_subtype(self, a, b)
     }
-
     fn element_count(&self) -> u32 {
         T::element_count(self)
     }
@@ -173,7 +172,7 @@ where
     }
 }
 
-impl<T> WasmModuleResources for std::sync::Arc<T>
+impl<T> WasmModuleResources for alloc::sync::Arc<T>
 where
     T: WasmModuleResources,
 {

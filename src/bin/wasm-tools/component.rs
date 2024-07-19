@@ -8,11 +8,12 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 
 use wasm_tools::Output;
+use wasmparser::WasmFeatures;
 use wat::Detect;
 use wit_component::{
     embed_component_metadata, ComponentEncoder, DecodedWasm, Linker, StringEncoding, WitPrinter,
 };
-use wit_parser::{Resolve, UnresolvedPackage};
+use wit_parser::{PackageId, Resolve};
 
 /// WebAssembly wit-based component tooling.
 #[derive(Parser)]
@@ -160,12 +161,53 @@ impl NewOpts {
             .encode()
             .context("failed to encode a component from module")?;
 
-        self.io.output(Output::Wasm {
-            bytes: &bytes,
-            wat: self.wat,
-        })?;
+        self.io.output_wasm(&bytes, self.wat)?;
 
         Ok(())
+    }
+}
+
+#[derive(Parser)]
+struct WitResolve {
+    /// Path to WIT files to load.
+    ///
+    /// This can be a directory containing `*.wit` files, a `*.wit` file itself,
+    /// or a `*.wasm` file which is a WIT package encoded as WebAssembly.
+    wit: PathBuf,
+
+    /// Features to enable when parsing the `wit` option.
+    ///
+    /// This flag enables the `@unstable` feature in WIT documents where the
+    /// items are otherwise hidden by default.
+    #[clap(long)]
+    features: Vec<String>,
+
+    /// Enable all features when parsing the `wit` option.
+    ///
+    /// This flag enables all `@unstable` features in WIT documents where the
+    /// items are otherwise hidden by default.
+    #[clap(long)]
+    all_features: bool,
+}
+
+impl WitResolve {
+    fn resolve_with_features(features: &[String], all_features: bool) -> Resolve {
+        let mut resolve = Resolve::default();
+        resolve.all_features = all_features;
+        for feature in features {
+            for f in feature.split_whitespace() {
+                for f in f.split(',').filter(|s| !s.is_empty()) {
+                    resolve.features.insert(f.to_string());
+                }
+            }
+        }
+        return resolve;
+    }
+
+    fn load(&self) -> Result<(Resolve, Vec<PackageId>)> {
+        let mut resolve = Self::resolve_with_features(&self.features, self.all_features);
+        let (pkg_ids, _) = resolve.push_path(&self.wit)?;
+        Ok((resolve, pkg_ids))
     }
 }
 
@@ -186,11 +228,8 @@ impl NewOpts {
 /// working with text format wasm.
 #[derive(Parser)]
 pub struct EmbedOpts {
-    /// The WIT package where the `world` that the core wasm module implements
-    /// lives.
-    ///
-    /// This can either be a directory or a path to a single `*.wit` file.
-    wit: PathBuf,
+    #[clap(flatten)]
+    resolve: WitResolve,
 
     #[clap(flatten)]
     io: wasm_tools::InputOutput,
@@ -198,18 +237,21 @@ pub struct EmbedOpts {
     /// The expected string encoding format for the component.
     ///
     /// Supported values are: `utf8` (default), `utf16`, and `compact-utf16`.
-    /// This is only applicable to the `--wit` argument to describe the string
+    /// This is only applicable to the `wit` argument to describe the string
     /// encoding of the functions in that world.
     #[clap(long, value_name = "ENCODING")]
     encoding: Option<StringEncoding>,
 
     /// The world that the component uses.
     ///
-    /// This is the path, within the `WIT` package provided as a positional
-    /// argument, to the `world` that the core wasm module works with. This can
-    /// either be a bare string which a document name that has a `default
-    /// world`, or it can be a `foo/bar` name where `foo` names a document and
-    /// `bar` names a world within that document.
+    /// This is the path, within the `WIT` source provided as a positional
+    /// argument, to the `world` that the core wasm module works with. If this
+    /// option is omitted then the "main package" pointed to by `WIT` must have
+    /// a single world and that's what is used to embed. Otherwise this could be
+    /// a bare string `foo` to point to the `world foo` within the main
+    /// package of WIT. Finally this can be a fully qualified name too such as
+    /// `wasi:http/proxy` which can select a world from a WIT dependency as
+    /// well.
     #[clap(short, long)]
     world: Option<String>,
 
@@ -241,10 +283,8 @@ impl EmbedOpts {
         } else {
             Some(self.io.parse_input_wasm()?)
         };
-        let mut resolve = Resolve::default();
-        let id = resolve.push_path(&self.wit)?.0;
-        let world = resolve.select_world(id, self.world.as_deref())?;
-
+        let (resolve, pkg_ids) = self.resolve.load()?;
+        let world = resolve.select_world(&pkg_ids, self.world.as_deref())?;
         let mut wasm = wasm.unwrap_or_else(|| wit_component::dummy_module(&resolve, world));
 
         embed_component_metadata(
@@ -254,10 +294,7 @@ impl EmbedOpts {
             self.encoding.unwrap_or(StringEncoding::UTF8),
         )?;
 
-        self.io.output(Output::Wasm {
-            bytes: &wasm,
-            wat: self.wat,
-        })?;
+        self.io.output_wasm(&wasm, self.wat)?;
 
         Ok(())
     }
@@ -346,6 +383,10 @@ pub struct LinkOpts {
     /// Generate trapping stubs for any missing functions
     #[clap(long)]
     stub_missing_functions: bool,
+
+    /// Use built-in implementations of `dlopen`/`dlsym`
+    #[clap(long)]
+    use_built_in_libdl: bool,
 }
 
 impl LinkOpts {
@@ -357,7 +398,8 @@ impl LinkOpts {
     fn run(self) -> Result<()> {
         let mut linker = Linker::default()
             .validate(!self.skip_validation)
-            .stub_missing_functions(self.stub_missing_functions);
+            .stub_missing_functions(self.stub_missing_functions)
+            .use_built_in_libdl(self.use_built_in_libdl);
 
         if let Some(stack_size) = self.stack_size {
             linker = linker.stack_size(stack_size);
@@ -379,10 +421,7 @@ impl LinkOpts {
             .encode()
             .context("failed to encode a component from modules")?;
 
-        self.output.output(Output::Wasm {
-            bytes: &bytes,
-            wat: self.wat,
-        })?;
+        self.output.output_wasm(&self.general, &bytes, self.wat)?;
 
         Ok(())
     }
@@ -455,6 +494,20 @@ pub struct WitOpts {
         conflicts_with = "wat"
     )]
     json: bool,
+
+    /// Features to enable when parsing the `wit` option.
+    ///
+    /// This flag enables the `@unstable` feature in WIT documents where the
+    /// items are otherwise hidden by default.
+    #[clap(long)]
+    features: Vec<String>,
+
+    /// Enable all features when parsing the `wit` option.
+    ///
+    /// This flag enables all `@unstable` features in WIT documents where the
+    /// items are otherwise hidden by default.
+    #[clap(long)]
+    all_features: bool,
 }
 
 impl WitOpts {
@@ -470,9 +523,7 @@ impl WitOpts {
         // This interprets all of the output options and performs such a task.
         if self.json {
             self.emit_json(&decoded)?;
-            return Ok(());
-        }
-        if self.wasm || self.wat {
+        } else if self.wasm || self.wat {
             self.emit_wasm(&decoded)?;
         } else {
             self.emit_wit(&decoded)?;
@@ -485,9 +536,10 @@ impl WitOpts {
         // `parse_wit_from_path`.
         if let Some(input) = &self.input {
             if input.is_dir() {
-                let mut resolve = Resolve::default();
-                let id = resolve.push_dir(&input)?.0;
-                return Ok(DecodedWasm::WitPackage(resolve, id));
+                let mut resolve =
+                    WitResolve::resolve_with_features(&self.features, self.all_features);
+                let (pkg_ids, _) = resolve.push_dir(&input)?;
+                return Ok(DecodedWasm::WitPackages(resolve, pkg_ids));
             }
         }
 
@@ -533,10 +585,10 @@ impl WitOpts {
                     Ok(s) => s,
                     Err(_) => bail!("input was not valid utf-8"),
                 };
-                let mut resolve = Resolve::default();
-                let pkg = UnresolvedPackage::parse(path, input)?;
-                let id = resolve.push(pkg)?;
-                Ok(DecodedWasm::WitPackage(resolve, id))
+                let mut resolve =
+                    WitResolve::resolve_with_features(&self.features, self.all_features);
+                let ids = resolve.push_str(path, input)?;
+                Ok(DecodedWasm::WitPackages(resolve, ids))
             }
         }
     }
@@ -544,19 +596,19 @@ impl WitOpts {
     fn emit_wasm(&self, decoded: &DecodedWasm) -> Result<()> {
         assert!(self.wasm || self.wat);
         assert!(self.out_dir.is_none());
+        if decoded.packages().len() != 1 {
+            bail!("emitting WASM for multi-package WIT files is not yet supported")
+        }
 
-        let bytes = wit_component::encode(None, decoded.resolve(), decoded.package())?;
+        let decoded_package = decoded.packages()[0];
+        let bytes = wit_component::encode(None, decoded.resolve(), decoded_package)?;
         if !self.skip_validation {
-            wasmparser::Validator::new_with_features(wasmparser::WasmFeatures {
-                component_model: true,
-                ..Default::default()
-            })
+            wasmparser::Validator::new_with_features(
+                WasmFeatures::default() | WasmFeatures::COMPONENT_MODEL,
+            )
             .validate_all(&bytes)?;
         }
-        self.output.output(Output::Wasm {
-            bytes: &bytes,
-            wat: self.wat,
-        })?;
+        self.output.output_wasm(&self.general, &bytes, self.wat)?;
         Ok(())
     }
 
@@ -564,7 +616,6 @@ impl WitOpts {
         assert!(!self.wasm && !self.wat);
 
         let resolve = decoded.resolve();
-        let main = decoded.package();
 
         let mut printer = WitPrinter::default();
         printer.emit_docs(!self.no_docs);
@@ -587,36 +638,51 @@ impl WitOpts {
                     *cnt += 1;
                 }
 
+                let main = decoded.packages();
                 for (id, pkg) in resolve.packages.iter() {
-                    let output = printer.print(resolve, id)?;
-                    let out_dir = if id == main {
+                    let is_main = main.contains(&id);
+                    let output = printer.print(resolve, &[id], is_main)?;
+                    let out_dir = if is_main {
                         dir.clone()
                     } else {
-                        let dir = dir.join("deps");
-                        let packages_with_same_name = &names[&pkg.name.name];
-                        if packages_with_same_name.len() == 1 {
-                            dir.join(&pkg.name.name)
+                        dir.join("deps")
+                    };
+                    let packages_with_same_name = &names[&pkg.name.name];
+                    let packages_with_same_namespace = packages_with_same_name[&pkg.name.namespace];
+                    let stem = if packages_with_same_name.len() == 1 {
+                        if packages_with_same_namespace == 1 {
+                            pkg.name.name.clone()
                         } else {
-                            let packages_with_same_namespace =
-                                packages_with_same_name[&pkg.name.namespace];
-                            if packages_with_same_namespace == 1 {
-                                dir.join(format!("{}:{}", pkg.name.namespace, pkg.name.name))
-                            } else {
-                                dir.join(pkg.name.to_string())
-                            }
+                            pkg.name
+                                .version
+                                .as_ref()
+                                .map(|ver| format!("{}@{}", pkg.name.name, ver))
+                                .unwrap_or_else(|| pkg.name.name.clone())
+                        }
+                    } else {
+                        if packages_with_same_namespace == 1 {
+                            format!("{}:{}", pkg.name.namespace, pkg.name.name)
+                        } else {
+                            pkg.name.to_string()
                         }
                     };
                     std::fs::create_dir_all(&out_dir)
                         .with_context(|| format!("failed to create directory: {out_dir:?}"))?;
-                    let path = out_dir.join("main.wit");
+                    let filename = format!("{stem}.wit");
+                    let path = out_dir.join(&filename);
                     std::fs::write(&path, &output)
                         .with_context(|| format!("failed to write file: {path:?}"))?;
                     println!("Writing: {}", path.display());
                 }
             }
             None => {
-                let output = printer.print(resolve, main)?;
-                self.output.output(Output::Wat(&output))?;
+                self.output.output(
+                    &self.general,
+                    Output::Wit {
+                        wit: &decoded,
+                        printer,
+                    },
+                )?;
             }
         }
 
@@ -628,7 +694,7 @@ impl WitOpts {
 
         let resolve = decoded.resolve();
         let output = serde_json::to_string_pretty(&resolve)?;
-        self.output.output(Output::Json(&output))?;
+        self.output.output(&self.general, Output::Json(&output))?;
 
         Ok(())
     }
@@ -640,12 +706,12 @@ pub struct TargetsOpts {
     #[clap(flatten)]
     general: wasm_tools::GeneralOpts,
 
-    /// The WIT package containing the `world` used to test a component for conformance.
-    ///
-    /// This can either be a directory or a path to a single `*.wit` file.
-    wit: PathBuf,
+    #[clap(flatten)]
+    resolve: WitResolve,
 
-    /// The world used to test whether a component conforms to its signature.
+    /// The world used to test whether a component conforms to its signature. If the `WIT` source
+    /// provided contains multiple packages, this option must be set, and must be of the
+    /// fully-qualified form (ex: "wasi:http/proxy")
     #[clap(short, long)]
     world: Option<String>,
 
@@ -660,9 +726,8 @@ impl TargetsOpts {
 
     /// Executes the application.
     fn run(self) -> Result<()> {
-        let mut resolve = Resolve::default();
-        let package_id = resolve.push_path(&self.wit)?.0;
-        let world = resolve.select_world(package_id, self.world.as_deref())?;
+        let (resolve, pkg_ids) = self.resolve.load()?;
+        let world = resolve.select_world(&pkg_ids, self.world.as_deref())?;
         let component_to_test = self.input.parse_wasm()?;
 
         wit_component::targets(&resolve, world, &component_to_test)?;
@@ -678,12 +743,8 @@ pub struct SemverCheckOpts {
     #[clap(flatten)]
     general: wasm_tools::GeneralOpts,
 
-    /// The WIT package containing the `prev` and `new` worlds used in
-    /// arguments.
-    ///
-    /// This can either be a directory, a path to a single `*.wit` file, or a
-    /// path to a wasm-encoded WIT package.
-    wit: PathBuf,
+    #[clap(flatten)]
+    resolve: WitResolve,
 
     /// The "previous" world, or older version, of what's being tested.
     ///
@@ -705,10 +766,9 @@ impl SemverCheckOpts {
     }
 
     fn run(self) -> Result<()> {
-        let mut resolve = Resolve::default();
-        let package_id = resolve.push_path(&self.wit)?.0;
-        let prev = resolve.select_world(package_id, Some(&self.prev))?;
-        let new = resolve.select_world(package_id, Some(&self.new))?;
+        let (resolve, pkg_ids) = self.resolve.load()?;
+        let prev = resolve.select_world(&pkg_ids, Some(self.prev.as_str()))?;
+        let new = resolve.select_world(&pkg_ids, Some(self.new.as_str()))?;
         wit_component::semver_check(resolve, prev, new)?;
         Ok(())
     }

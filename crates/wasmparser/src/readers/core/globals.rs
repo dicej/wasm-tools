@@ -16,7 +16,7 @@
 use crate::{BinaryReader, ConstExpr, FromReader, GlobalType, Result, SectionLimited};
 
 /// Represents a core WebAssembly global.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 pub struct Global<'a> {
     /// The global's type.
     pub ty: GlobalType,
@@ -37,13 +37,25 @@ impl<'a> FromReader<'a> for Global<'a> {
 
 impl<'a> FromReader<'a> for GlobalType {
     fn from_reader(reader: &mut BinaryReader<'a>) -> Result<Self> {
+        let content_type = reader.read()?;
+        let flags = reader.read_u8()?;
+        if reader.features().shared_everything_threads() {
+            if flags > 0b11 {
+                bail!(reader.original_position() - 1, "malformed global flags")
+            }
+        } else {
+            if flags > 0b1 {
+                bail!(
+                    reader.original_position() - 1,
+                    "malformed mutability -- or shared globals \
+                     require the shared-everything-threads proposal"
+                )
+            }
+        }
         Ok(GlobalType {
-            content_type: reader.read()?,
-            mutable: match reader.read_u8()? {
-                0x00 => false,
-                0x01 => true,
-                _ => bail!(reader.original_position() - 1, "malformed mutability",),
-            },
+            content_type,
+            mutable: (flags & 0b01) > 0,
+            shared: (flags & 0b10) > 0,
         })
     }
 }

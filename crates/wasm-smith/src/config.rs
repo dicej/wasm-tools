@@ -313,6 +313,12 @@ define_config! {
         /// Defaults to `false`.
         pub gc_enabled: bool = false,
 
+        /// Determines whether the custom-page-sizes proposal is enabled when
+        /// generating a Wasm module.
+        ///
+        /// Defaults to `false`.
+        pub custom_page_sizes_enabled: bool = false,
+
         /// Returns whether we should generate custom sections or not. Defaults
         /// to false.
         pub generate_custom_sections: bool = false,
@@ -373,17 +379,21 @@ define_config! {
         /// wasm proposal.
         pub max_memories: usize = 1,
 
-        /// The maximum, in 64k Wasm pages, of any 32-bit memory's initial or
-        /// maximum size.
+        /// The maximum, in bytes, of any 32-bit memory's initial or maximum
+        /// size.
         ///
-        /// Defaults to 2^16.
-        pub max_memory32_pages: u64 = 1 << 16,
+        /// May not be larger than `2**32`.
+        ///
+        /// Defaults to `2**32`.
+        pub max_memory32_bytes: u64 = u32::MAX as u64 + 1,
 
-        /// The maximum, in 64k Wasm pages, of any 64-bit memory's initial or
-        /// maximum size.
+        /// The maximum, in bytes, of any 64-bit memory's initial or maximum
+        /// size.
         ///
-        /// Defaults to 2^48.
-        pub max_memory64_pages: u64 = 1 << 48,
+        /// May not be larger than `2**64`.
+        ///
+        /// Defaults to `2**64`.
+        pub max_memory64_bytes: u128 = u64::MAX as u128 + 1,
 
         /// The maximum number of modules to use. Defaults to 10.
         ///
@@ -398,7 +408,7 @@ define_config! {
 
         /// The maximum, elements, of any table's initial or maximum
         /// size. Defaults to 1 million.
-        pub max_table_elements: u32 = 1_000_000,
+        pub max_table_elements: u64 = 1_000_000,
 
         /// The maximum number of tables to use. Defaults to 1.
         ///
@@ -658,8 +668,8 @@ impl<'a> Arbitrary<'a> for Config {
             max_instructions: u.int_in_range(0..=MAX_MAXIMUM)?,
             max_memories: u.int_in_range(0..=100)?,
             max_tables,
-            max_memory32_pages: u.int_in_range(0..=1 << 16)?,
-            max_memory64_pages: u.int_in_range(0..=1 << 48)?,
+            max_memory32_bytes: u.int_in_range(0..=u32::MAX as u64 + 1)?,
+            max_memory64_bytes: u.int_in_range(0..=u64::MAX as u128 + 1)?,
             min_uleb_size: u.int_in_range(0..=5)?,
             bulk_memory_enabled: u.arbitrary()?,
             reference_types_enabled,
@@ -715,6 +725,7 @@ impl<'a> Arbitrary<'a> for Config {
             export_everything: false,
             tail_call_enabled: false,
             gc_enabled: false,
+            custom_page_sizes_enabled: false,
             generate_custom_sections: false,
             allow_invalid_funcs: false,
         })

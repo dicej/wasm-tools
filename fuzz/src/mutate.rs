@@ -11,7 +11,7 @@ pub fn run(u: &mut Unstructured<'_>) -> Result<()> {
 
     let mut seed = 0;
     let mut preserve_semantics = false;
-    let (wasm, config) = crate::generate_valid_module(u, |config, u| {
+    let (wasm, _config) = crate::generate_valid_module(u, |config, u| {
         config.exceptions_enabled = false;
         config.gc_enabled = false;
         seed = u.arbitrary()?;
@@ -55,19 +55,7 @@ pub fn run(u: &mut Unstructured<'_>) -> Result<()> {
         }
     };
 
-    // Note that on-by-default features in wasmparser are not disabled here if
-    // the feature was disabled in `config` when the module was generated. For
-    // example if the input module doesn't have simd then wasm-mutate may
-    // produce a module that uses simd, which is ok and expected.
-    //
-    // Otherwise only forward some off-by-default features which are affected by
-    // wasm-smith's generation of modules and wasm-mutate otherwise won't add
-    // itself if it doesn't already exist.
-    let mut features = WasmFeatures::default();
-    features.relaxed_simd = config.relaxed_simd_enabled;
-    features.multi_memory = config.max_memories > 1;
-    features.memory64 = config.memory64_enabled;
-    features.threads = config.threads_enabled;
+    let features = WasmFeatures::all();
 
     for (i, mutated_wasm) in iterator.take(10).enumerate() {
         let mutated_wasm = match mutated_wasm {
@@ -271,11 +259,11 @@ mod eval {
             log::debug!("invoking `{}`", export.name());
             match (
                 {
-                    orig_store.add_fuel(1_000).unwrap();
+                    orig_store.set_fuel(1_000).unwrap();
                     orig_func.call(&mut *orig_store, &args, &mut orig_results)
                 },
                 {
-                    mutated_store.add_fuel(1000).unwrap();
+                    mutated_store.set_fuel(1000).unwrap();
                     mutated_func.call(&mut *mutated_store, &args, &mut mutated_results)
                 },
             ) {

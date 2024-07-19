@@ -53,31 +53,28 @@ impl Opts {
     }
 
     pub fn run(self) -> Result<()> {
+        eprintln!("WARNING: `wasm-tools compose` has been deprecated.");
+        eprintln!("");
+        eprintln!("Please use `wac` instead. You can find more information about `wac` at https://github.com/bytecodealliance/wac.");
         let config = self.create_config()?;
         log::debug!("configuration:\n{:#?}", config);
 
         let bytes = ComponentComposer::new(&self.component, &config).compose()?;
 
-        self.output.output(wasm_tools::Output::Wasm {
-            bytes: &bytes,
-            wat: self.wat,
-        })?;
+        self.output.output_wasm(&self.general, &bytes, self.wat)?;
 
         if config.skip_validation {
             log::debug!("output validation was skipped");
         } else {
-            Validator::new_with_features(WasmFeatures {
-                component_model: true,
-                ..Default::default()
-            })
-            .validate_all(&bytes)
-            .with_context(|| {
-                let output = match self.output.output_path() {
-                    Some(s) => format!(" `{}`", s.display()),
-                    None => String::new(),
-                };
-                format!("failed to validate output component{output}")
-            })?;
+            Validator::new_with_features(WasmFeatures::default() | WasmFeatures::COMPONENT_MODEL)
+                .validate_all(&bytes)
+                .with_context(|| {
+                    let output = match self.output.output_path() {
+                        Some(s) => format!(" `{}`", s.display()),
+                        None => String::new(),
+                    };
+                    format!("failed to validate output component{output}")
+                })?;
 
             log::debug!("output component validated successfully");
         }

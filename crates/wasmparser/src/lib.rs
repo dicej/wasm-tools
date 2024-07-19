@@ -27,6 +27,31 @@
 //! the examples documented for [`Parser::parse`] or [`Parser::parse_all`].
 
 #![deny(missing_docs)]
+#![no_std]
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+
+extern crate alloc;
+#[cfg(feature = "std")]
+#[macro_use]
+extern crate std;
+
+/// A small "prelude" to use throughout this crate.
+///
+/// This crate is tagged with `#![no_std]` meaning that we get libcore's prelude
+/// by default. This crate also uses `alloc`, however, and common types there
+/// like `String`. This custom prelude helps bring those types into scope to
+/// avoid having to import each of them manually.
+mod prelude {
+    pub use alloc::borrow::ToOwned;
+    pub use alloc::boxed::Box;
+    pub use alloc::format;
+    pub use alloc::string::{String, ToString};
+    pub use alloc::vec;
+    pub use alloc::vec::Vec;
+
+    #[cfg(feature = "validate")]
+    pub use crate::collections::{IndexMap, IndexSet, Map, Set};
+}
 
 /// A helper macro to conveniently iterate over all opcodes recognized by this
 /// crate. This can be used to work with either the [`Operator`] enumeration or
@@ -43,7 +68,7 @@
 /// The list of specializable Wasm proposals is as follows:
 ///
 /// - `@mvp`: Denoting a Wasm operator from the initial Wasm MVP version.
-/// - `@exceptions`: [Wasm `expection-handling` proposal]
+/// - `@exceptions`: [Wasm `exception-handling` proposal]
 /// - `@tail_call`: [Wasm `tail-calls` proposal]
 /// - `@reference_types`: [Wasm `reference-types` proposal]
 /// - `@sign_extension`: [Wasm `sign-extension-ops` proposal]
@@ -54,7 +79,7 @@
 /// - `@relaxed_simd`: [Wasm `relaxed-simd` proposal]
 /// - `@gc`: [Wasm `gc` proposal]
 ///
-/// [Wasm `expection-handling` proposal]:
+/// [Wasm `exception-handling` proposal]:
 /// https://github.com/WebAssembly/exception-handling
 ///
 /// [Wasm `tail-calls` proposal]:
@@ -133,18 +158,18 @@ macro_rules! for_each_operator {
             @exceptions Throw { tag_index: u32 } => visit_throw
             @exceptions ThrowRef => visit_throw_ref
             // Deprecated old instructions from the exceptions proposal
-            @exceptions Try { blockty: $crate::BlockType } => visit_try
-            @exceptions Catch { tag_index: u32 } => visit_catch
-            @exceptions Rethrow { relative_depth: u32 } => visit_rethrow
-            @exceptions Delegate { relative_depth: u32 } => visit_delegate
-            @exceptions CatchAll => visit_catch_all
+            @legacy_exceptions Try { blockty: $crate::BlockType } => visit_try
+            @legacy_exceptions Catch { tag_index: u32 } => visit_catch
+            @legacy_exceptions Rethrow { relative_depth: u32 } => visit_rethrow
+            @legacy_exceptions Delegate { relative_depth: u32 } => visit_delegate
+            @legacy_exceptions CatchAll => visit_catch_all
             @mvp End => visit_end
             @mvp Br { relative_depth: u32 } => visit_br
             @mvp BrIf { relative_depth: u32 } => visit_br_if
             @mvp BrTable { targets: $crate::BrTable<'a> } => visit_br_table
             @mvp Return => visit_return
             @mvp Call { function_index: u32 } => visit_call
-            @mvp CallIndirect { type_index: u32, table_index: u32, table_byte: u8 } => visit_call_indirect
+            @mvp CallIndirect { type_index: u32, table_index: u32 } => visit_call_indirect
             @tail_call ReturnCall { function_index: u32 } => visit_return_call
             @tail_call ReturnCallIndirect { type_index: u32, table_index: u32 } => visit_return_call_indirect
             @mvp Drop => visit_drop
@@ -178,8 +203,8 @@ macro_rules! for_each_operator {
             @mvp I64Store8 { memarg: $crate::MemArg } => visit_i64_store8
             @mvp I64Store16 { memarg: $crate::MemArg } => visit_i64_store16
             @mvp I64Store32 { memarg: $crate::MemArg } => visit_i64_store32
-            @mvp MemorySize { mem: u32, mem_byte: u8 } => visit_memory_size
-            @mvp MemoryGrow { mem: u32, mem_byte: u8 } => visit_memory_grow
+            @mvp MemorySize { mem: u32 } => visit_memory_size
+            @mvp MemoryGrow { mem: u32 } => visit_memory_grow
             @mvp I32Const { value: i32 } => visit_i32_const
             @mvp I64Const { value: i64 } => visit_i64_const
             @mvp F32Const { value: $crate::Ieee32 } => visit_f32_const
@@ -468,6 +493,46 @@ macro_rules! for_each_operator {
             @threads I64AtomicRmw16CmpxchgU { memarg: $crate::MemArg } => visit_i64_atomic_rmw16_cmpxchg_u
             @threads I64AtomicRmw32CmpxchgU { memarg: $crate::MemArg } => visit_i64_atomic_rmw32_cmpxchg_u
 
+            // Also 0xFE prefixed operators
+            // shared-everything threads
+            // https://github.com/WebAssembly/shared-everything-threads
+            @shared_everything_threads GlobalAtomicGet { ordering: $crate::Ordering, global_index: u32 } => visit_global_atomic_get
+            @shared_everything_threads GlobalAtomicSet { ordering: $crate::Ordering, global_index: u32 } => visit_global_atomic_set
+            @shared_everything_threads GlobalAtomicRmwAdd { ordering: $crate::Ordering, global_index: u32 } => visit_global_atomic_rmw_add
+            @shared_everything_threads GlobalAtomicRmwSub { ordering: $crate::Ordering, global_index: u32 } => visit_global_atomic_rmw_sub
+            @shared_everything_threads GlobalAtomicRmwAnd { ordering: $crate::Ordering, global_index: u32 } => visit_global_atomic_rmw_and
+            @shared_everything_threads GlobalAtomicRmwOr { ordering: $crate::Ordering, global_index: u32 } => visit_global_atomic_rmw_or
+            @shared_everything_threads GlobalAtomicRmwXor { ordering: $crate::Ordering, global_index: u32 } => visit_global_atomic_rmw_xor
+            @shared_everything_threads GlobalAtomicRmwXchg { ordering: $crate::Ordering, global_index: u32 } => visit_global_atomic_rmw_xchg
+            @shared_everything_threads GlobalAtomicRmwCmpxchg { ordering: $crate::Ordering, global_index: u32 } => visit_global_atomic_rmw_cmpxchg
+            @shared_everything_threads TableAtomicGet { ordering: $crate::Ordering, table_index: u32 } => visit_table_atomic_get
+            @shared_everything_threads TableAtomicSet { ordering: $crate::Ordering, table_index: u32 } => visit_table_atomic_set
+            @shared_everything_threads TableAtomicRmwXchg { ordering: $crate::Ordering, table_index: u32 } => visit_table_atomic_rmw_xchg
+            @shared_everything_threads TableAtomicRmwCmpxchg { ordering: $crate::Ordering, table_index: u32 } => visit_table_atomic_rmw_cmpxchg
+            @shared_everything_threads StructAtomicGet { ordering: $crate::Ordering, struct_type_index: u32, field_index: u32  } => visit_struct_atomic_get
+            @shared_everything_threads StructAtomicGetS { ordering: $crate::Ordering, struct_type_index: u32, field_index: u32  } => visit_struct_atomic_get_s
+            @shared_everything_threads StructAtomicGetU { ordering: $crate::Ordering, struct_type_index: u32, field_index: u32  } => visit_struct_atomic_get_u
+            @shared_everything_threads StructAtomicSet { ordering: $crate::Ordering, struct_type_index: u32, field_index: u32  } => visit_struct_atomic_set
+            @shared_everything_threads StructAtomicRmwAdd { ordering: $crate::Ordering, struct_type_index: u32, field_index: u32  } => visit_struct_atomic_rmw_add
+            @shared_everything_threads StructAtomicRmwSub { ordering: $crate::Ordering, struct_type_index: u32, field_index: u32  } => visit_struct_atomic_rmw_sub
+            @shared_everything_threads StructAtomicRmwAnd { ordering: $crate::Ordering, struct_type_index: u32, field_index: u32  } => visit_struct_atomic_rmw_and
+            @shared_everything_threads StructAtomicRmwOr { ordering: $crate::Ordering, struct_type_index: u32, field_index: u32  } => visit_struct_atomic_rmw_or
+            @shared_everything_threads StructAtomicRmwXor { ordering: $crate::Ordering, struct_type_index: u32, field_index: u32  } => visit_struct_atomic_rmw_xor
+            @shared_everything_threads StructAtomicRmwXchg { ordering: $crate::Ordering, struct_type_index: u32, field_index: u32  } => visit_struct_atomic_rmw_xchg
+            @shared_everything_threads StructAtomicRmwCmpxchg { ordering: $crate::Ordering, struct_type_index: u32, field_index: u32  } => visit_struct_atomic_rmw_cmpxchg
+            @shared_everything_threads ArrayAtomicGet { ordering: $crate::Ordering, array_type_index: u32 } => visit_array_atomic_get
+            @shared_everything_threads ArrayAtomicGetS { ordering: $crate::Ordering, array_type_index: u32 } => visit_array_atomic_get_s
+            @shared_everything_threads ArrayAtomicGetU { ordering: $crate::Ordering, array_type_index: u32 } => visit_array_atomic_get_u
+            @shared_everything_threads ArrayAtomicSet { ordering: $crate::Ordering, array_type_index: u32 } => visit_array_atomic_set
+            @shared_everything_threads ArrayAtomicRmwAdd { ordering: $crate::Ordering, array_type_index: u32 } => visit_array_atomic_rmw_add
+            @shared_everything_threads ArrayAtomicRmwSub { ordering: $crate::Ordering, array_type_index: u32 } => visit_array_atomic_rmw_sub
+            @shared_everything_threads ArrayAtomicRmwAnd { ordering: $crate::Ordering, array_type_index: u32 } => visit_array_atomic_rmw_and
+            @shared_everything_threads ArrayAtomicRmwOr { ordering: $crate::Ordering, array_type_index: u32 } => visit_array_atomic_rmw_or
+            @shared_everything_threads ArrayAtomicRmwXor { ordering: $crate::Ordering, array_type_index: u32 } => visit_array_atomic_rmw_xor
+            @shared_everything_threads ArrayAtomicRmwXchg { ordering: $crate::Ordering, array_type_index: u32 } => visit_array_atomic_rmw_xchg
+            @shared_everything_threads ArrayAtomicRmwCmpxchg { ordering: $crate::Ordering, array_type_index: u32 } => visit_array_atomic_rmw_cmpxchg
+            @shared_everything_threads RefI31Shared => visit_ref_i31_shared
+
             // 0xFD operators
             // 128-bit SIMD
             // - https://github.com/webassembly/simd
@@ -753,14 +818,24 @@ macro_rules! bail {
 }
 
 pub use crate::binary_reader::{BinaryReader, BinaryReaderError, Result};
+pub use crate::features::*;
 pub use crate::parser::*;
 pub use crate::readers::*;
-pub use crate::resources::*;
-pub use crate::validator::*;
 
 mod binary_reader;
+mod features;
 mod limits;
 mod parser;
 mod readers;
+
+#[cfg(feature = "validate")]
 mod resources;
+#[cfg(feature = "validate")]
 mod validator;
+#[cfg(feature = "validate")]
+pub use crate::resources::*;
+#[cfg(feature = "validate")]
+pub use crate::validator::*;
+
+#[cfg(feature = "validate")]
+pub mod collections;

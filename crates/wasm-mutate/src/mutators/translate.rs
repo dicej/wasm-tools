@@ -108,6 +108,13 @@ pub trait Translator {
         memarg(self.as_obj(), arg)
     }
 
+    fn translate_ordering(&mut self, arg: &wasmparser::Ordering) -> Result<Ordering> {
+        Ok(match arg {
+            wasmparser::Ordering::SeqCst => Ordering::SeqCst,
+            wasmparser::Ordering::AcqRel => Ordering::AcqRel,
+        })
+    }
+
     fn remap(&mut self, item: Item, idx: u32) -> Result<u32> {
         let _ = item;
         Ok(idx)
@@ -148,6 +155,8 @@ pub fn table_type(
         element_type: t.translate_refty(&ty.element_type)?,
         minimum: ty.initial,
         maximum: ty.maximum,
+        table64: ty.table64,
+        shared: ty.shared,
     })
 }
 
@@ -160,6 +169,7 @@ pub fn memory_type(
         minimum: ty.initial,
         maximum: ty.maximum,
         shared: ty.shared,
+        page_size_log2: ty.page_size_log2,
     })
 }
 
@@ -170,6 +180,7 @@ pub fn global_type(
     Ok(wasm_encoder::GlobalType {
         val_type: t.translate_ty(&ty.content_type)?,
         mutable: ty.mutable,
+        shared: ty.shared,
     })
 }
 
@@ -200,20 +211,16 @@ pub fn refty(t: &mut dyn Translator, ty: &wasmparser::RefType) -> Result<RefType
 
 pub fn heapty(t: &mut dyn Translator, ty: &wasmparser::HeapType) -> Result<HeapType> {
     match ty {
-        wasmparser::HeapType::Func => Ok(HeapType::Func),
-        wasmparser::HeapType::Extern => Ok(HeapType::Extern),
-        wasmparser::HeapType::Any => Ok(HeapType::Any),
-        wasmparser::HeapType::None => Ok(HeapType::None),
-        wasmparser::HeapType::NoExtern => Ok(HeapType::NoExtern),
-        wasmparser::HeapType::NoFunc => Ok(HeapType::NoFunc),
-        wasmparser::HeapType::Eq => Ok(HeapType::Eq),
-        wasmparser::HeapType::Struct => Ok(HeapType::Struct),
-        wasmparser::HeapType::Array => Ok(HeapType::Array),
-        wasmparser::HeapType::I31 => Ok(HeapType::I31),
-        wasmparser::HeapType::Exn => Ok(HeapType::Exn),
         wasmparser::HeapType::Concrete(i) => Ok(HeapType::Concrete(
             t.remap(Item::Type, i.as_module_index().unwrap())?,
         )),
+        wasmparser::HeapType::Abstract { shared, ty } => {
+            let ty = (*ty).into();
+            Ok(HeapType::Abstract {
+                shared: *shared,
+                ty,
+            })
+        }
     }
 }
 
@@ -240,7 +247,11 @@ pub fn const_expr(
         match op {
             Operator::RefFunc { .. }
             | Operator::RefNull {
-                hty: wasmparser::HeapType::Func,
+                hty:
+                    wasmparser::HeapType::Abstract {
+                        ty: wasmparser::AbstractHeapType::Func,
+                        ..
+                    },
                 ..
             }
             | Operator::GlobalGet { .. } => {}
@@ -359,14 +370,13 @@ pub fn op(t: &mut dyn Translator, op: &Operator<'_>) -> Result<Instruction<'stat
                 .into(),
             $arg.default(),
         ));
-        (map $arg:ident table_byte) => (());
-        (map $arg:ident mem_byte) => (());
         (map $arg:ident flags) => (());
         (map $arg:ident ty) => (t.translate_ty($arg)?);
         (map $arg:ident hty) => (t.translate_heapty($arg)?);
         (map $arg:ident from_ref_type) => (t.translate_refty($arg)?);
         (map $arg:ident to_ref_type) => (t.translate_refty($arg)?);
         (map $arg:ident memarg) => (t.translate_memarg($arg)?);
+        (map $arg:ident ordering) => (t.translate_ordering($arg)?);
         (map $arg:ident local_index) => (*$arg);
         (map $arg:ident value) => ($arg);
         (map $arg:ident lane) => (*$arg);
@@ -390,22 +400,6 @@ pub fn op(t: &mut dyn Translator, op: &Operator<'_>) -> Result<Instruction<'stat
         (build V128Const $arg:ident) => (I::V128Const($arg.i128()));
         (build TryTable $table:ident) => (unimplemented_try_table());
         (build $op:ident $arg:ident) => (I::$op($arg));
-        (build CallIndirect $ty:ident $table:ident $_:ident) => (I::CallIndirect {
-            ty: $ty,
-            table: $table,
-        });
-        (build ReturnCallIndirect $ty:ident $table:ident) => (I::ReturnCallIndirect {
-            ty: $ty,
-            table: $table,
-        });
-        (build MemoryGrow $mem:ident $_:ident) => (I::MemoryGrow($mem));
-        (build MemorySize $mem:ident $_:ident) => (I::MemorySize($mem));
-        (build StructNew $type_index:ident) => (I::StructNew($type_index));
-        (build ArrayGet $type_index:ident) => (I::ArrayGet($type_index));
-        (build ArrayGetS $type_index:ident) => (I::ArrayGetS($type_index));
-        (build ArrayGetU $type_index:ident) => (I::ArrayGetU($type_index));
-        (build ArraySet $type_index:ident) => (I::ArraySet($type_index));
-        (build ArrayFill $type_index:ident) => (I::ArrayFill($type_index));
         (build $op:ident $($arg:ident)*) => (I::$op { $($arg),* });
     }
 
@@ -469,8 +463,7 @@ pub fn code(t: &mut dyn Translator, body: FunctionBody<'_>, s: &mut CodeSection)
         .collect::<Result<Vec<_>>>()?;
     let mut func = Function::new(locals);
 
-    let mut reader = body.get_operators_reader()?;
-    reader.allow_memarg64(true);
+    let reader = body.get_operators_reader()?;
     for op in reader {
         let op = op?;
         func.instruction(&t.translate_op(&op)?);

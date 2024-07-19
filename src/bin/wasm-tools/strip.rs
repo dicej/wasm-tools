@@ -46,8 +46,11 @@ impl Opts {
                 return to_delete.is_match(name);
             }
 
-            // Finally default strip everything but the `name` and any `component-type` sections.
-            name != "name" && !name.starts_with("component-type:")
+            // Finally default strip everything but:
+            // * the `name` section
+            // * any `component-type` sections
+            // * the `dylink.0` section
+            name != "name" && !name.starts_with("component-type:") && name != "dylink.0"
         };
 
         let mut output = Vec::new();
@@ -103,10 +106,7 @@ impl Opts {
             }
         }
 
-        self.io.output(wasm_tools::Output::Wasm {
-            bytes: &output,
-            wat: self.wat,
-        })?;
+        self.io.output_wasm(&output, self.wat)?;
         Ok(())
     }
 }

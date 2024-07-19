@@ -1,11 +1,12 @@
 use crate::ast::lex::Span;
-use crate::ast::{parse_use_path, AstUsePath};
+use crate::ast::{parse_use_path, ParsedUsePath};
 #[cfg(feature = "serde")]
 use crate::serde_::{serialize_arena, serialize_id_map};
 use crate::{
     AstItem, Docs, Error, Function, FunctionKind, Handle, IncludeName, Interface, InterfaceId,
-    PackageName, Result_, Results, Type, TypeDef, TypeDefKind, TypeId, TypeOwner,
-    UnresolvedPackage, World, WorldId, WorldItem, WorldKey,
+    InterfaceSpan, PackageName, Result_, Results, SourceMap, Stability, Type, TypeDef, TypeDefKind,
+    TypeId, TypeOwner, UnresolvedPackage, UnresolvedPackageGroup, World, WorldId, WorldItem,
+    WorldKey, WorldSpan,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use id_arena::{Arena, Id};
@@ -64,6 +65,19 @@ pub struct Resolve {
     /// A map of package names to the ID of the package with that name.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub package_names: IndexMap<PackageName, PackageId>,
+
+    /// Activated features for this [`Resolve`].
+    ///
+    /// This set of features is empty by default. This is consulted for
+    /// `@unstable` annotations in loaded WIT documents. Any items with
+    /// `@unstable` are filtered out unless their feature is present within this
+    /// set.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub features: IndexSet<String>,
+
+    /// Activate all features for this [`Resolve`].
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub all_features: bool,
 }
 
 /// A WIT package within a `Resolve`.
@@ -96,7 +110,42 @@ pub type PackageId = Id<Package>;
 enum ParsedFile {
     #[cfg(feature = "decoding")]
     Package(PackageId),
-    Unresolved(UnresolvedPackage),
+    Unresolved(UnresolvedPackageGroup),
+}
+
+/// Visitor helper for performing topological sort on a group of packages.
+fn visit<'a>(
+    pkg: &'a UnresolvedPackage,
+    pkg_details_map: &'a BTreeMap<PackageName, (UnresolvedPackage, usize)>,
+    order: &mut IndexSet<PackageName>,
+    visiting: &mut HashSet<&'a PackageName>,
+    source_maps: &[SourceMap],
+) -> Result<()> {
+    if order.contains(&pkg.name) {
+        return Ok(());
+    }
+
+    match pkg_details_map.get(&pkg.name) {
+        Some(pkg_details) => {
+            let (_, source_maps_index) = pkg_details;
+            source_maps[*source_maps_index].rewrite_error(|| {
+                for (i, (dep, _)) in pkg.foreign_deps.iter().enumerate() {
+                    let span = pkg.foreign_dep_spans[i];
+                    if !visiting.insert(dep) {
+                        bail!(Error::new(span, "package depends on itself"));
+                    }
+                    if let Some(dep) = pkg_details_map.get(dep) {
+                        let (dep_pkg, _) = dep;
+                        visit(dep_pkg, pkg_details_map, order, visiting, source_maps)?;
+                    }
+                    assert!(visiting.remove(dep));
+                }
+                assert!(order.insert(pkg.name.clone()));
+                Ok(())
+            })
+        }
+        None => panic!("No pkg_details found for package when doing topological sort"),
+    }
 }
 
 impl Resolve {
@@ -105,28 +154,40 @@ impl Resolve {
         Resolve::default()
     }
 
-    /// Parse a WIT package from the input `path`.
+    /// Parse WIT packages from the input `path`.
     ///
     /// The input `path` can be one of:
     ///
     /// * A directory containing a WIT package with an optional `deps` directory
     ///   for any dependent WIT packages it references.
-    /// * A single standalone WIT file depending on what's already in `Resolve`.
+    /// * A single standalone WIT file.
     /// * A wasm-encoded WIT package as a single file in the wasm binary format.
     /// * A wasm-encoded WIT package as a single file in the wasm text format.
     ///
-    /// The `PackageId` of the parsed package is returned. For more information
-    /// see [`Resolve::push_dir`] and [`Resolve::push_file`]. This method will
-    /// automatically call the appropriate method based on what kind of
-    /// filesystem entry `path` is.
+    /// In all of these cases packages are allowed to depend on previously
+    /// inserted packages into this `Resolve`. Resolution for packages is based
+    /// on the name of each package and reference.
     ///
-    /// Returns the top-level [`PackageId`] as well as a list of all files read
-    /// during this parse.
-    pub fn push_path(&mut self, path: impl AsRef<Path>) -> Result<(PackageId, Vec<PathBuf>)> {
+    /// This method returns a list of `PackageId` elements and additionally a
+    /// list of `PathBuf` elements. The `PackageId` elements represent the "main
+    /// package" that was parsed. For example if a single WIT file was specified
+    /// this will be all the packages found in the file. For a directory this
+    /// will be all the packages in the directory itself, but not in the `deps`
+    /// directory. The list of `PackageId` values is useful to pass to
+    /// [`Resolve::select_world`] to take a user-specified world in a
+    /// conventional fashion and select which to use for bindings generation.
+    ///
+    /// The returned list of `PathBuf` elements represents all files parsed
+    /// during this operation. This can be useful for systems that want to
+    /// rebuild or regenerate bindings based on files modified.
+    ///
+    /// More information can also be found at [`Resolve::push_dir`] and
+    /// [`Resolve::push_file`].
+    pub fn push_path(&mut self, path: impl AsRef<Path>) -> Result<(Vec<PackageId>, Vec<PathBuf>)> {
         self._push_path(path.as_ref())
     }
 
-    fn _push_path(&mut self, path: &Path) -> Result<(PackageId, Vec<PathBuf>)> {
+    fn _push_path(&mut self, path: &Path) -> Result<(Vec<PackageId>, Vec<PathBuf>)> {
         if path.is_dir() {
             self.push_dir(path).with_context(|| {
                 format!(
@@ -135,98 +196,129 @@ impl Resolve {
                 )
             })
         } else {
-            let id = self.push_file(path)?;
-            Ok((id, vec![path.to_path_buf()]))
+            let ids = self.push_file(path)?;
+            Ok((ids, vec![path.to_path_buf()]))
         }
     }
 
-    /// Parses the filesystem directory at `path` as a WIT package and returns
-    /// the fully resolved [`PackageId`] as a result.
-    ///
-    /// The directory itself is parsed with [`UnresolvedPackage::parse_dir`]
-    /// which has more information on the layout of the directory. This method,
-    /// however, additionally supports an optional `deps` dir where dependencies
-    /// can be located.
-    ///
-    /// All entries in the `deps` directory are inspected and parsed as follows:
-    ///
-    /// * Any directories inside of `deps` are assumed to be another WIT package
-    ///   and are parsed with [`UnresolvedPackage::parse_dir`].
-    /// * WIT files (`*.wit`) are parsed with [`UnresolvedPackage::parse_file`].
-    /// * WebAssembly files (`*.wasm` or `*.wat`) are assumed to be WIT packages
-    ///   encoded to wasm and are parsed and inserted into `self`.
-    ///
-    /// This function returns the [`PackageId`] of the root parsed package at
-    /// `path`, along with a list of all paths that were consumed during parsing
-    /// for the root package and all dependency packages.
-    pub fn push_dir(&mut self, path: &Path) -> Result<(PackageId, Vec<PathBuf>)> {
-        let pkg = UnresolvedPackage::parse_dir(path)
-            .with_context(|| format!("failed to parse package: {}", path.display()))?;
+    fn sort_unresolved_packages(
+        &mut self,
+        unresolved_groups: Vec<UnresolvedPackageGroup>,
+    ) -> Result<(Vec<PackageId>, Vec<PathBuf>)> {
+        let mut pkg_ids = Vec::new();
+        let mut path_bufs = Vec::new();
+        let mut pkg_details_map = BTreeMap::new();
+        let mut source_maps = Vec::new();
+        for (i, unresolved_group) in unresolved_groups.into_iter().enumerate() {
+            let UnresolvedPackageGroup {
+                packages,
+                source_map,
+            } = unresolved_group;
 
-        let deps = path.join("deps");
-        let mut deps = self
-            .parse_deps_dir(&deps)
-            .with_context(|| format!("failed to parse dependency directory: {}", deps.display()))?;
+            source_maps.push(source_map);
+            for pkg in packages {
+                pkg_details_map.insert(pkg.name.clone(), (pkg, i));
+            }
+        }
 
         // Perform a simple topological sort which will bail out on cycles
         // and otherwise determine the order that packages must be added to
         // this `Resolve`.
         let mut order = IndexSet::new();
         let mut visiting = HashSet::new();
-        for pkg in deps.values().chain([&pkg]) {
-            visit(&pkg, &deps, &mut order, &mut visiting)?;
+        for pkg_details in pkg_details_map.values() {
+            let (pkg, _) = pkg_details;
+            visit(
+                pkg,
+                &pkg_details_map,
+                &mut order,
+                &mut visiting,
+                &source_maps,
+            )?;
         }
 
-        // Using the topological ordering insert each package incrementally.
-        // Additionally note that the last item visited here is the root
-        // package, which is the one returned here.
-        let mut last = None;
-        let mut files = Vec::new();
-        let mut pkg = Some(pkg);
+        // Ensure that the final output is topologically sorted. Use a set to ensure that we render
+        // the buffers for each `SourceMap` only once, even though multiple packages may references
+        // the same `SourceMap`.
+        let mut seen_source_maps = HashSet::new();
         for name in order {
-            let pkg = deps.remove(&name).unwrap_or_else(|| pkg.take().unwrap());
-            files.extend(pkg.source_files().map(|p| p.to_path_buf()));
-            let pkgid = self.push(pkg)?;
-            last = Some(pkgid);
-        }
-
-        return Ok((last.unwrap(), files));
-
-        fn visit<'a>(
-            pkg: &'a UnresolvedPackage,
-            deps: &'a BTreeMap<PackageName, UnresolvedPackage>,
-            order: &mut IndexSet<PackageName>,
-            visiting: &mut HashSet<&'a PackageName>,
-        ) -> Result<()> {
-            if order.contains(&pkg.name) {
-                return Ok(());
-            }
-            pkg.source_map.rewrite_error(|| {
-                for (i, (dep, _)) in pkg.foreign_deps.iter().enumerate() {
-                    let span = pkg.foreign_dep_spans[i];
-                    if !visiting.insert(dep) {
-                        bail!(Error {
-                            span,
-                            msg: format!("package depends on itself"),
-                        });
+            match pkg_details_map.remove(&name) {
+                Some((pkg, source_map_index)) => {
+                    let source_map = &source_maps[source_map_index];
+                    if !seen_source_maps.contains(&source_map_index) {
+                        seen_source_maps.insert(source_map_index);
+                        path_bufs.extend(source_map.source_files().map(|p| p.to_path_buf()));
                     }
-                    if let Some(dep) = deps.get(dep) {
-                        visit(dep, deps, order, visiting)?;
-                    }
-                    assert!(visiting.remove(dep));
+                    pkg_ids.push(self.push(pkg, source_map)?);
                 }
-                assert!(order.insert(pkg.name.clone()));
-                Ok(())
-            })
+                None => panic!("package in topologically ordered set, but not in package map"),
+            }
         }
+
+        Ok((pkg_ids, path_bufs))
     }
 
-    fn parse_deps_dir(&mut self, path: &Path) -> Result<BTreeMap<PackageName, UnresolvedPackage>> {
-        let mut ret = BTreeMap::new();
+    /// Parses the filesystem directory at `path` as a WIT package and returns
+    /// a fully resolved [`PackageId`] list as a result.
+    ///
+    /// The directory itself is parsed with [`UnresolvedPackageGroup::parse_dir`]
+    /// and then all packages found are inserted into this `Resolve`. The `path`
+    /// specified may have a `deps` subdirectory which is probed automatically
+    /// for any other WIT dependencies.
+    ///
+    /// The `deps` folder may contain:
+    ///
+    /// * `$path/deps/my-package/*.wit` - a directory that may contain multiple
+    ///   WIT files. This is parsed with [`UnresolvedPackageGroup::parse_dir`]
+    ///   and then inserted into this [`Resolve`]. Note that cannot recursively
+    ///   contain a `deps` directory.
+    /// * `$path/deps/my-package.wit` - a single-file WIT package. This is
+    ///   parsed with [`Resolve::push_file`] and then added to `self` for
+    ///   name reoslution.
+    /// * `$path/deps/my-package.{wasm,wat}` - a wasm-encoded WIT package either
+    ///   in the text for binary format.
+    ///
+    /// In all cases entries in the `deps` folder are added to `self` first
+    /// before adding files found in `path` itself. All WIT packages found are
+    /// candidates for name-based resolution that other packages may used.
+    ///
+    /// This function returns a tuple of two values. The first value is a list
+    /// of [`PackageId`] values which represents the WIT packages found within
+    /// `path`, but not those within `deps`. The `path` provided may contain
+    /// only a single WIT package but might also use the multi-package form of
+    /// WIT, and the returned list will indicate which was used. This argument
+    /// is useful for passing to [`Resolve::select_world`] for choosing
+    /// something to bindgen with.
+    ///
+    /// The second value returned here is the list of paths that were parsed
+    /// when generating the return value. This can be useful for build systems
+    /// that want to rebuild bindings whenever one of the files change.
+    pub fn push_dir(&mut self, path: impl AsRef<Path>) -> Result<(Vec<PackageId>, Vec<PathBuf>)> {
+        let path = path.as_ref();
+        let deps_path = path.join("deps");
+        let unresolved_deps = self.parse_deps_dir(&deps_path).with_context(|| {
+            format!(
+                "failed to parse dependency directory: {}",
+                deps_path.display()
+            )
+        })?;
+        let (_, mut path_bufs) = self.sort_unresolved_packages(unresolved_deps)?;
+
+        let unresolved_top_level = UnresolvedPackageGroup::parse_dir(path)
+            .with_context(|| format!("failed to parse package: {}", path.display()))?;
+        let (pkgs_ids, mut top_level_path_bufs) =
+            self.sort_unresolved_packages(vec![unresolved_top_level])?;
+
+        path_bufs.append(&mut top_level_path_bufs);
+        Ok((pkgs_ids, path_bufs))
+    }
+
+    fn parse_deps_dir(&mut self, path: &Path) -> Result<Vec<UnresolvedPackageGroup>> {
+        let mut unresolved_deps = Vec::new();
         // If there's no `deps` dir, then there's no deps, so return the
         // empty set.
         if !path.exists() {
-            return Ok(ret);
+            return Ok(unresolved_deps);
         }
         let mut entries = path
             .read_dir()
@@ -235,38 +327,37 @@ impl Resolve {
         entries.sort_by_key(|e| e.file_name());
         for dep in entries {
             let path = dep.path();
-
-            let pkg = if dep.file_type()?.is_dir() || path.metadata()?.is_dir() {
+            if dep.file_type()?.is_dir() || path.metadata()?.is_dir() {
                 // If this entry is a directory or a symlink point to a
                 // directory then always parse it as an `UnresolvedPackage`
                 // since it's intentional to not support recursive `deps`
                 // directories.
-                UnresolvedPackage::parse_dir(&path)
-                    .with_context(|| format!("failed to parse package: {}", path.display()))?
+                unresolved_deps.push(
+                    UnresolvedPackageGroup::parse_dir(&path)
+                        .with_context(|| format!("failed to parse package: {}", path.display()))?,
+                )
             } else {
                 // If this entry is a file then we may want to ignore it but
                 // this may also be a standalone WIT file or a `*.wasm` or
                 // `*.wat` encoded package.
                 let filename = dep.file_name();
-                match Path::new(&filename).extension().and_then(|s| s.to_str()) {
-                    Some("wit") | Some("wat") | Some("wasm") => match self._push_file(&path)? {
-                        #[cfg(feature = "decoding")]
-                        ParsedFile::Package(_) => continue,
-                        ParsedFile::Unresolved(pkg) => pkg,
-                    },
+                unresolved_deps.push(
+                    match Path::new(&filename).extension().and_then(|s| s.to_str()) {
+                        Some("wit") | Some("wat") | Some("wasm") => match self._push_file(&path)? {
+                            #[cfg(feature = "decoding")]
+                            ParsedFile::Package(_) => continue,
+                            ParsedFile::Unresolved(pkgs) => pkgs,
+                        },
 
-                    // Other files in deps dir are ignored for now to avoid
-                    // accidentally including things like `.DS_Store` files in
-                    // the call below to `parse_dir`.
-                    _ => continue,
-                }
+                        // Other files in deps dir are ignored for now to avoid
+                        // accidentally including things like `.DS_Store` files in
+                        // the call below to `parse_dir`.
+                        _ => continue,
+                    },
+                )
             };
-            let prev = ret.insert(pkg.name.clone(), pkg);
-            if let Some(prev) = prev {
-                bail!("duplicate definitions of package `{}` found", prev.name);
-            }
         }
-        Ok(ret)
+        Ok(unresolved_deps)
     }
 
     /// Parses the contents of `path` from the filesystem and pushes the result
@@ -280,13 +371,14 @@ impl Resolve {
     ///   In this the package and all of its dependencies are automatically
     ///   inserted into `self`.
     ///
-    /// In both situations the `PackageId` of the resulting resolved package is
-    /// returned from this method.
-    pub fn push_file(&mut self, path: impl AsRef<Path>) -> Result<PackageId> {
+    /// In both situations the `PackageId`s of the resulting resolved packages
+    /// are returned from this method. The return value is mostly useful in
+    /// conjunction with [`Resolve::select_world`].
+    pub fn push_file(&mut self, path: impl AsRef<Path>) -> Result<Vec<PackageId>> {
         match self._push_file(path.as_ref())? {
             #[cfg(feature = "decoding")]
-            ParsedFile::Package(id) => Ok(id),
-            ParsedFile::Unresolved(pkg) => self.push(pkg),
+            ParsedFile::Package(id) => Ok(vec![id]),
+            ParsedFile::Unresolved(pkgs) => self.push_group(pkgs),
         }
     }
 
@@ -316,9 +408,9 @@ impl Resolve {
                     DecodedWasm::Component(..) => {
                         bail!("found an actual component instead of an encoded WIT package in wasm")
                     }
-                    DecodedWasm::WitPackage(resolve, pkg) => {
+                    DecodedWasm::WitPackages(resolve, pkgs) => {
                         let remap = self.merge(resolve)?;
-                        return Ok(ParsedFile::Package(remap.packages[pkg.index()]));
+                        return Ok(ParsedFile::Package(remap.packages[pkgs[0].index()]));
                     }
                 }
             }
@@ -329,21 +421,52 @@ impl Resolve {
             Ok(s) => s,
             Err(_) => bail!("input file is not valid utf-8 [{}]", path.display()),
         };
-        let pkg = UnresolvedPackage::parse(path, text)?;
-        Ok(ParsedFile::Unresolved(pkg))
+        let pkgs = UnresolvedPackageGroup::parse(path, text)?;
+        Ok(ParsedFile::Unresolved(pkgs))
     }
 
     /// Appends a new [`UnresolvedPackage`] to this [`Resolve`], creating a
     /// fully resolved package with no dangling references.
     ///
-    /// The `deps` argument indicates that the named dependencies in
-    /// `unresolved` to packages are resolved by the mapping specified.
+    /// All the dependencies of `unresolved` must already have been loaded
+    /// within this `Resolve` via previous calls to `push` or other methods such
+    /// as [`Resolve::push_path`].
     ///
     /// Any dependency resolution error or otherwise world-elaboration error
-    /// will be returned here. If successful a package identifier is returned.
-    pub fn push(&mut self, mut unresolved: UnresolvedPackage) -> Result<PackageId> {
-        let source_map = mem::take(&mut unresolved.source_map);
+    /// will be returned here, if successful a package identifier is returned
+    /// which corresponds to the package that was just inserted.
+    pub fn push(
+        &mut self,
+        unresolved: UnresolvedPackage,
+        source_map: &SourceMap,
+    ) -> Result<PackageId> {
         source_map.rewrite_error(|| Remap::default().append(self, unresolved))
+    }
+
+    /// Appends new [`UnresolvedPackageGroup`] to this [`Resolve`], creating a
+    /// fully resolved package with no dangling references.
+    ///
+    /// Any dependency resolution error or otherwise world-elaboration error
+    /// will be returned here, if successful a package identifier is returned
+    /// which corresponds to the package that was just inserted.
+    ///
+    /// The returned [`PackageId`]s are listed in topologically sorted order.
+    pub fn push_group(
+        &mut self,
+        unresolved_groups: UnresolvedPackageGroup,
+    ) -> Result<Vec<PackageId>> {
+        let (pkg_ids, _) = self.sort_unresolved_packages(vec![unresolved_groups])?;
+        Ok(pkg_ids)
+    }
+
+    /// Convenience method for combining [`UnresolvedPackageGroup::parse`] and
+    /// [`Resolve::push_group`].
+    ///
+    /// The `path` provided is used for error messages but otherwise is not
+    /// read. This method does not touch the filesystem. The `contents` provided
+    /// are the contents of a WIT package.
+    pub fn push_str(&mut self, path: impl AsRef<Path>, contents: &str) -> Result<Vec<PackageId>> {
+        self.push_group(UnresolvedPackageGroup::parse(path.as_ref(), contents)?)
     }
 
     pub fn all_bits_valid(&self, ty: &Type) -> bool {
@@ -409,7 +532,7 @@ impl Resolve {
             self.packages.len()
         );
 
-        let mut map = MergeMap::new(&resolve, &self)?;
+        let mut map = MergeMap::new(&resolve, &self);
         map.build()?;
         let MergeMap {
             package_map,
@@ -446,66 +569,92 @@ impl Resolve {
             interfaces,
             packages,
             package_names,
+            features: _,
+            ..
         } = resolve;
 
         let mut moved_types = Vec::new();
         for (id, mut ty) in types {
-            let new_id = type_map.get(&id).copied().unwrap_or_else(|| {
-                log::debug!("moving type {:?}", ty.name);
-                moved_types.push(id);
-                remap.update_typedef(self, &mut ty);
-                self.types.alloc(ty)
-            });
+            let new_id = match type_map.get(&id).copied() {
+                Some(id) => {
+                    update_stability(&ty.stability, &mut self.types[id].stability)?;
+                    id
+                }
+                None => {
+                    log::debug!("moving type {:?}", ty.name);
+                    moved_types.push(id);
+                    remap.update_typedef(self, &mut ty, None)?;
+                    self.types.alloc(ty)
+                }
+            };
             assert_eq!(remap.types.len(), id.index());
-            remap.types.push(new_id);
+            remap.types.push(Some(new_id));
         }
 
         let mut moved_interfaces = Vec::new();
         for (id, mut iface) in interfaces {
-            let new_id = interface_map.get(&id).copied().unwrap_or_else(|| {
-                log::debug!("moving interface {:?}", iface.name);
-                moved_interfaces.push(id);
-                remap.update_interface(self, &mut iface);
-                self.interfaces.alloc(iface)
-            });
+            let new_id = match interface_map.get(&id).copied() {
+                Some(id) => {
+                    update_stability(&iface.stability, &mut self.interfaces[id].stability)?;
+                    id
+                }
+                None => {
+                    log::debug!("moving interface {:?}", iface.name);
+                    moved_interfaces.push(id);
+                    remap.update_interface(self, &mut iface, None)?;
+                    self.interfaces.alloc(iface)
+                }
+            };
             assert_eq!(remap.interfaces.len(), id.index());
-            remap.interfaces.push(new_id);
+            remap.interfaces.push(Some(new_id));
         }
 
         let mut moved_worlds = Vec::new();
         for (id, mut world) in worlds {
-            let new_id = world_map.get(&id).copied().unwrap_or_else(|| {
-                log::debug!("moving world {}", world.name);
-                moved_worlds.push(id);
-                let mut update = |map: &mut IndexMap<WorldKey, WorldItem>| {
-                    for (mut name, mut item) in mem::take(map) {
-                        remap.update_world_key(&mut name);
-                        match &mut item {
-                            WorldItem::Function(f) => remap.update_function(self, f),
-                            WorldItem::Interface(i) => *i = remap.interfaces[i.index()],
-                            WorldItem::Type(i) => *i = remap.types[i.index()],
+            let new_id = match world_map.get(&id).copied() {
+                Some(id) => {
+                    update_stability(&world.stability, &mut self.worlds[id].stability)?;
+                    id
+                }
+                None => {
+                    log::debug!("moving world {}", world.name);
+                    moved_worlds.push(id);
+                    let mut update = |map: &mut IndexMap<WorldKey, WorldItem>| -> Result<_> {
+                        for (mut name, mut item) in mem::take(map) {
+                            remap.update_world_key(&mut name, None)?;
+                            match &mut item {
+                                WorldItem::Function(f) => remap.update_function(self, f, None)?,
+                                WorldItem::Interface { id, .. } => {
+                                    *id = remap.map_interface(*id, None)?
+                                }
+                                WorldItem::Type(i) => *i = remap.map_type(*i, None)?,
+                            }
+                            map.insert(name, item);
                         }
-                        map.insert(name, item);
-                    }
-                };
-                update(&mut world.imports);
-                update(&mut world.exports);
-                self.worlds.alloc(world)
-            });
+                        Ok(())
+                    };
+                    update(&mut world.imports)?;
+                    update(&mut world.exports)?;
+                    self.worlds.alloc(world)
+                }
+            };
             assert_eq!(remap.worlds.len(), id.index());
-            remap.worlds.push(new_id);
+            remap.worlds.push(Some(new_id));
         }
 
         for (id, mut pkg) in packages {
-            let new_id = package_map.get(&id).copied().unwrap_or_else(|| {
-                for (_, id) in pkg.interfaces.iter_mut() {
-                    *id = remap.interfaces[id.index()];
+            let new_id = match package_map.get(&id).copied() {
+                Some(id) => id,
+                None => {
+                    for (_, id) in pkg.interfaces.iter_mut() {
+                        *id = remap.map_interface(*id, None)?;
+                    }
+                    for (_, id) in pkg.worlds.iter_mut() {
+                        *id = remap.map_world(*id, None)?;
+                    }
+                    self.packages.alloc(pkg)
                 }
-                for (_, id) in pkg.worlds.iter_mut() {
-                    *id = remap.worlds[id.index()];
-                }
-                self.packages.alloc(pkg)
-            });
+            };
             assert_eq!(remap.packages.len(), id.index());
             remap.packages.push(new_id);
         }
@@ -525,20 +674,20 @@ impl Resolve {
         // are ids within `resolve`, so they're translated through `remap` to
         // ids within `self`.
         for id in moved_worlds {
-            let id = remap.worlds[id.index()];
+            let id = remap.map_world(id, None)?;
             let pkg = self.worlds[id].package.as_mut().unwrap();
             *pkg = remap.packages[pkg.index()];
         }
         for id in moved_interfaces {
-            let id = remap.interfaces[id.index()];
+            let id = remap.map_interface(id, None)?;
             let pkg = self.interfaces[id].package.as_mut().unwrap();
             *pkg = remap.packages[pkg.index()];
         }
         for id in moved_types {
-            let id = remap.types[id.index()];
+            let id = remap.map_type(id, None)?;
             match &mut self.types[id].owner {
-                TypeOwner::Interface(id) => *id = remap.interfaces[id.index()],
-                TypeOwner::World(id) => *id = remap.worlds[id.index()],
+                TypeOwner::Interface(id) => *id = remap.map_interface(*id, None)?,
+                TypeOwner::World(id) => *id = remap.map_world(*id, None)?,
                 TypeOwner::None => {}
             }
         }
@@ -550,13 +699,13 @@ impl Resolve {
         for (name, pkg, iface) in interfaces_to_add {
             let prev = self.packages[pkg]
                 .interfaces
-                .insert(name, remap.interfaces[iface.index()]);
+                .insert(name, remap.map_interface(iface, None)?);
             assert!(prev.is_none());
         }
         for (name, pkg, world) in worlds_to_add {
             let prev = self.packages[pkg]
                 .worlds
-                .insert(name, remap.worlds[world.index()]);
+                .insert(name, remap.map_world(world, None)?);
             assert!(prev.is_none());
         }
 
@@ -581,83 +730,44 @@ impl Resolve {
         let from_world = &self.worlds[from];
         let into_world = &self.worlds[into];
 
-        // Build a map of the imports/exports in `into` going the reverse
-        // direction from what's listed. This is then consulted below to ensure
-        // that the same item isn't exported or imported under two different
-        // names which isn't allowed in the component model.
-        let mut into_imports_by_id = HashMap::new();
-        let mut into_exports_by_id = HashMap::new();
-        for (name, import) in into_world.imports.iter() {
-            if let WorldItem::Interface(id) = *import {
-                let prev = into_imports_by_id.insert(id, name);
-                assert!(prev.is_none());
-            }
-        }
-        for (name, export) in into_world.exports.iter() {
-            if let WorldItem::Interface(id) = *export {
-                let prev = into_exports_by_id.insert(id, name);
-                assert!(prev.is_none());
-            }
-        }
-        for (name, import) in from_world.imports.iter() {
-            // If the "from" world imports an interface which is already
-            // imported by the "into" world then this is allowed if the names
-            // are the same. Importing the same interface under different names
-            // isn't allowed, but otherwise merging imports of
-            // same-named-interfaces is allowed to merge them together.
-            if let WorldItem::Interface(id) = import {
-                if let Some(prev) = into_imports_by_id.get(id) {
-                    if *prev != name {
-                        let name = self.name_world_key(name);
-                        let prev = self.name_world_key(prev);
-                        bail!("import `{name}` conflicts with previous name of `{prev}`");
-                    }
-                }
-            }
-        }
-        for (name, export) in from_world.exports.iter() {
-            // Note that unlike imports same-named exports are not handled here
-            // since if something is exported twice there's no way to "unify" it
-            // so it's left as an error.
-            if let WorldItem::Interface(id) = export {
-                if let Some(prev) = into_exports_by_id.get(id) {
-                    let name = self.name_world_key(name);
-                    let prev = self.name_world_key(prev);
-                    bail!("export `{name}` conflicts with previous name of `{prev}`");
-                }
-            }
-        }
-
-        // Next walk over the interfaces imported into `from_world` and queue up
-        // imports to get inserted into `into_world`.
+        // First walk over all the imports of `from` world and figure out what
+        // to do with them.
+        //
+        // If the same item exists in `from` and `into` then merge it together
+        // below with `merge_world_item` which basically asserts they're the
+        // same. Otherwise queue up a new import since if `from` has more
+        // imports than `into` then it's fine to add new imports.
         for (name, from_import) in from_world.imports.iter() {
             match into_world.imports.get(name) {
-                Some(into_import) => match (from_import, into_import) {
-                    // If these imports, which have the same name, are of the
-                    // same interface then union them together at this point.
-                    (WorldItem::Interface(from), WorldItem::Interface(into)) if from == into => {
-                        continue
-                    }
-                    _ => {
-                        let name = self.name_world_key(name);
-                        bail!("duplicate import found for interface `{name}`");
-                    }
-                },
-                None => new_imports.push((name.clone(), from_import.clone())),
+                Some(into_import) => {
+                    let name = self.name_world_key(name);
+                    self.merge_world_item(from_import, into_import)
+                        .with_context(|| format!("failed to merge world import {name}"))?;
+                }
+                None => {
+                    new_imports.push((name.clone(), from_import.clone()));
+                }
             }
         }
 
-        // All exports at this time must be unique. For example the same
-        // interface exported from two locations can't really be resolved to one
-        // canonical definition, so make sure that merging worlds only succeeds
-        // if the worlds have disjoint sets of exports.
-        for (name, export) in from_world.exports.iter() {
+        // Next walk over exports of `from` and process these similarly to
+        // imports.
+        for (name, from_export) in from_world.exports.iter() {
             match into_world.exports.get(name) {
-                Some(_) => {
+                Some(into_export) => {
                     let name = self.name_world_key(name);
-                    bail!("duplicate export found for interface `{name}`");
+                    self.merge_world_item(from_export, into_export)
+                        .with_context(|| format!("failed to merge world export {name}"))?;
                 }
-                None => new_exports.push((name.clone(), export.clone())),
+                None => {
+                    // See comments in `ensure_can_add_world_export` for why
+                    // this is slightly different than imports.
+                    self.ensure_can_add_world_export(into_world, name, from_export)
+                        .with_context(|| {
+                            format!("failed to add export `{}`", self.name_world_key(name))
+                        })?;
+                    new_exports.push((name.clone(), from_export.clone()));
+                }
             }
         }
 
@@ -670,6 +780,125 @@ impl Resolve {
         for (name, export) in new_exports {
             let prev = into.exports.insert(name, export);
             assert!(prev.is_none());
+        }
+
+        Ok(())
+    }
+
+    fn merge_world_item(&self, from: &WorldItem, into: &WorldItem) -> Result<()> {
+        let mut map = MergeMap::new(self, self);
+        match (from, into) {
+            (WorldItem::Interface { id: from, .. }, WorldItem::Interface { id: into, .. }) => {
+                // If these imports are the same that can happen, for
+                // example, when both worlds to `import foo:bar/baz;`. That
+                // foreign interface will point to the same interface within
+                // `Resolve`.
+                if from == into {
+                    return Ok(());
+                }
+
+                // .. otherwise this MUST be a case of
+                // `import foo: interface { ... }`. If `from != into` but
+                // both `from` and `into` have the same name then the
+                // `WorldKey::Interface` case is ruled out as otherwise
+                // they'd have different names.
+                //
+                // In the case of an anonymous interface all we can do is
+                // ensure that the interfaces both match, so use `MergeMap`
+                // for that.
+                map.build_interface(*from, *into)
+                    .context("failed to merge interfaces")?;
+            }
+
+            // Like `WorldKey::Name` interfaces for functions and types the
+            // structure is asserted to be the same.
+            (WorldItem::Function(from), WorldItem::Function(into)) => {
+                map.build_function(from, into)
+                    .context("failed to merge functions")?;
+            }
+            (WorldItem::Type(from), WorldItem::Type(into)) => {
+                map.build_type_id(*from, *into)
+                    .context("failed to merge types")?;
+            }
+
+            // Kind-level mismatches are caught here.
+            (WorldItem::Interface { .. }, _)
+            | (WorldItem::Function { .. }, _)
+            | (WorldItem::Type { .. }, _) => {
+                bail!("different kinds of items");
+            }
+        }
+        assert!(map.interfaces_to_add.is_empty());
+        assert!(map.worlds_to_add.is_empty());
+        Ok(())
+    }
+
+    /// This method ensures that the world export of `name` and `item` can be
+    /// added to the world `into` without changing the meaning of `into`.
+    ///
+    /// This is somewhat tricky due to how exports/imports are elaborated today
+    /// but the basic idea is that the transitive dependencies of an `export`
+    /// will be implicitly `import`ed if they're not otherwise listed as
+    /// exports. That means that if a transitive dependency of a preexisting
+    /// export is added as a new export it might change the meaning of an
+    /// existing import if it was otherwise already hooked up to an import.
+    ///
+    /// This method rules out this situation.
+    fn ensure_can_add_world_export(
+        &self,
+        into: &World,
+        name: &WorldKey,
+        item: &WorldItem,
+    ) -> Result<()> {
+        assert!(!into.exports.contains_key(name));
+        let interface = match name {
+            // Top-level exports always depend on imports, so these are always
+            // allowed to be added.
+            WorldKey::Name(_) => return Ok(()),
+
+            // This is the case we're worried about. Here if the key is an
+            // interface then the item must also be an interface.
+            WorldKey::Interface(key) => {
+                match item {
+                    WorldItem::Interface { id, .. } => assert_eq!(id, key),
+                    _ => unreachable!(),
+                }
+                *key
+            }
+        };
+
+        // For `interface` to be added as a new export of `into` then it must be
+        // the case that no previous export of `into` depends on `interface`.
+        // Test that by walking all interface exports and seeing if any types
+        // refer to this interface.
+        for (export_name, export) in into.exports.iter() {
+            let export_interface = match export_name {
+                WorldKey::Name(_) => continue,
+                WorldKey::Interface(key) => {
+                    match export {
+                        WorldItem::Interface { id, .. } => assert_eq!(id, key),
+                        _ => unreachable!(),
+                    }
+                    *key
+                }
+            };
+            assert!(export_interface != interface);
+            let iface = &self.interfaces[export_interface];
+            for (name, ty) in iface.types.iter() {
+                let other_ty = match self.types[*ty].kind {
+                    TypeDefKind::Type(Type::Id(ty)) => ty,
+                    _ => continue,
+                };
+                if self.types[other_ty].owner != TypeOwner::Interface(interface) {
+                    continue;
+                }
+
+                let export_name = self.name_world_key(export_name);
+                bail!(
+                    "export `{export_name}` has a type `{name}` which could \
+                     change meaning if this world export were added"
+                )
+            }
         }
 
         Ok(())
@@ -698,46 +927,154 @@ impl Resolve {
         base
     }
 
-    /// Attempts to locate a world given the "default" package `pkg` and the
+    /// Attempts to locate a world given the "default" set of `packages` and the
     /// optional string specifier `world`.
     ///
     /// This method is intended to be used by bindings generation tools to
-    /// select a world from either `pkg` or a package in this `Resolve`.
+    /// select a world from either `packages` or a package in this `Resolve`.
+    /// The `packages` list is a return value from methods such as
+    /// [`push_path`](Resolve::push_path), [`push_dir`](Resolve::push_dir),
+    /// [`push_file`](Resolve::push_file), [`push_group`](Resolve::push_group),
+    /// or [`push_str`](Resolve::push_str). The return values of those methods
+    /// are the "main package list" which is specified by the user and is used
+    /// as a heuristic for world selection.
     ///
-    /// If `world` is `None` then `pkg` must have precisely one world which will
-    /// be returned.
+    /// If `world` is `None` then `packages` must have one entry and that
+    /// package must have exactly one world. If this is the case then that world
+    /// will be returned, otherwise an error will be returned.
     ///
     /// If `world` is `Some` then it can either be:
     ///
-    /// * A kebab-name of a world contained within `pkg` which is being
-    ///   selected, such as `"the-world"`.
+    /// * A kebab-name of a world such as `"the-world"`. In this situation
+    ///   the `packages` list must have only a single entry. If `packages` has
+    ///   no entries or more than one, or if the kebab-name does not exist in
+    ///   the one package specified, then an error will be returned.
     ///
     /// * An ID-based form of a world which is selected within this `Resolve`,
-    ///   ignoring `pkg`. For example `"wasi:http/proxy"`.
+    ///   for example `"wasi:http/proxy"`. In this situation the `packages`
+    ///   array is ignored and the ID specified is use to lookup a package. Note
+    ///   that a version does not need to be specified in this string if there's
+    ///   only one package of the same name and it has a version. In this
+    ///   situation the version can be omitted.
     ///
     /// If successful the corresponding `WorldId` is returned, otherwise an
     /// error is returned.
-    pub fn select_world(&self, pkg: PackageId, world: Option<&str>) -> Result<WorldId> {
-        let world = match world {
-            Some(world) => world,
-            None => {
-                let pkg = &self.packages[pkg];
-                match pkg.worlds.len() {
-                    0 => bail!("no worlds found in package `{}`", pkg.name),
-                    1 => return Ok(*pkg.worlds.values().next().unwrap()),
-                    _ => bail!(
-                        "multiple worlds found in package `{}`: one must be explicitly chosen",
-                        pkg.name
-                    ),
-                }
-            }
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use anyhow::Result;
+    /// use wit_parser::Resolve;
+    ///
+    /// fn main() -> Result<()> {
+    ///     let mut resolve = Resolve::default();
+    ///
+    ///     // For inputs which have a single package and only one world `None`
+    ///     // can be specified.
+    ///     let ids = resolve.push_str(
+    ///         "./my-test.wit",
+    ///         r#"
+    ///             package example:wit1;
+    ///
+    ///             world foo {
+    ///                 // ...
+    ///             }
+    ///         "#,
+    ///     )?;
+    ///     assert!(resolve.select_world(&ids, None).is_ok());
+    ///
+    ///     // For inputs which have a single package and multiple worlds then
+    ///     // a world must be specified.
+    ///     let ids = resolve.push_str(
+    ///         "./my-test.wit",
+    ///         r#"
+    ///             package example:wit2;
+    ///
+    ///             world foo { /* ... */ }
+    ///
+    ///             world bar { /* ... */ }
+    ///         "#,
+    ///     )?;
+    ///     assert!(resolve.select_world(&ids, None).is_err());
+    ///     assert!(resolve.select_world(&ids, Some("foo")).is_ok());
+    ///     assert!(resolve.select_world(&ids, Some("bar")).is_ok());
+    ///
+    ///     // For inputs which have more than one package then a fully
+    ///     // qualified name must be specified.
+    ///     let ids = resolve.push_str(
+    ///         "./my-test.wit",
+    ///         r#"
+    ///             package example:wit3 {
+    ///                 world foo { /* ... */ }
+    ///             }
+    ///
+    ///             package example:wit4 {
+    ///                 world foo { /* ... */ }
+    ///             }
+    ///         "#,
+    ///     )?;
+    ///     assert!(resolve.select_world(&ids, None).is_err());
+    ///     assert!(resolve.select_world(&ids, Some("foo")).is_err());
+    ///     assert!(resolve.select_world(&ids, Some("example:wit3/foo")).is_ok());
+    ///     assert!(resolve.select_world(&ids, Some("example:wit4/foo")).is_ok());
+    ///
+    ///     // Note that the `ids` or `packages` argument is ignored if a fully
+    ///     // qualified world specified is provided meaning previous worlds
+    ///     // can be selected.
+    ///     assert!(resolve.select_world(&[], Some("example:wit1/foo")).is_ok());
+    ///     assert!(resolve.select_world(&[], Some("example:wit2/foo")).is_ok());
+    ///
+    ///     // When selecting with a version it's ok to drop the version when
+    ///     // there's only a single copy of that package in `Resolve`.
+    ///     resolve.push_str(
+    ///         "./my-test.wit",
+    ///         r#"
+    ///             package example:wit5@1.0.0;
+    ///
+    ///             world foo { /* ... */ }
+    ///         "#,
+    ///     )?;
+    ///     assert!(resolve.select_world(&[], Some("example:wit5/foo")).is_ok());
+    ///
+    ///     // However when a single package has multiple versions in a resolve
+    ///     // it's required to specify the version to select which one.
+    ///     resolve.push_str(
+    ///         "./my-test.wit",
+    ///         r#"
+    ///             package example:wit5@2.0.0;
+    ///
+    ///             world foo { /* ... */ }
+    ///         "#,
+    ///     )?;
+    ///     assert!(resolve.select_world(&[], Some("example:wit5/foo")).is_err());
+    ///     assert!(resolve.select_world(&[], Some("example:wit5/foo@1.0.0")).is_ok());
+    ///     assert!(resolve.select_world(&[], Some("example:wit5/foo@2.0.0")).is_ok());
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn select_world(&self, packages: &[PackageId], world: Option<&str>) -> Result<WorldId> {
+        let world_path = match world {
+            Some(world) => Some(
+                parse_use_path(world)
+                    .with_context(|| format!("failed to parse world specifier `{world}`"))?,
+            ),
+            None => None,
         };
 
-        let path = parse_use_path(world)
-            .with_context(|| format!("failed to parse world specifier `{world}`"))?;
-        let (pkg, world) = match path {
-            AstUsePath::Name(name) => (pkg, name),
-            AstUsePath::Package(pkg, interface) => {
+        let (pkg, world_name) = match world_path {
+            Some(ParsedUsePath::Name(name)) => match packages {
+                [] => bail!("no packages were found to locate the world `{name}` within"),
+                [one] => (*one, name),
+                [..] => {
+                    bail!(
+                        "the supplied WIT source files describe multiple packages; \
+                         please provide a fully-qualified world-specifier select \
+                         a world amongst these packages"
+                    )
+                }
+            },
+            Some(ParsedUsePath::Package(pkg, interface)) => {
                 let pkg = match self.package_names.get(&pkg) {
                     Some(pkg) => *pkg,
                     None => {
@@ -763,14 +1100,43 @@ impl Resolve {
                         }
                     }
                 };
-                (pkg, interface)
+                (pkg, interface.to_string())
             }
+            None => match packages {
+                [] => bail!("no packages were specified nor is a world specified"),
+                [..] => {
+                    let worlds = packages
+                        .iter()
+                        .flat_map(|pkg| {
+                            self.packages[*pkg]
+                                .worlds
+                                .values()
+                                .map(|world| (*pkg, *world))
+                        })
+                        .collect::<Vec<_>>();
+
+                    match &worlds[..] {
+                        [] => bail!("none of the specified packages contain a world"),
+                        [(_, world)] => return Ok(*world),
+                        _ => bail!(
+                            "multiple worlds found; one must be explicitly chosen:{}",
+                            worlds
+                                .iter()
+                                .map(|(pkg, world)| format!(
+                                    "\n  {}/{}",
+                                    self.packages[*pkg].name, self.worlds[*world].name
+                                ))
+                                .collect::<String>()
+                        ),
+                    }
+                }
+            },
         };
         let pkg = &self.packages[pkg];
         pkg.worlds
-            .get(&world)
+            .get(&world_name)
             .copied()
-            .ok_or_else(|| anyhow!("no world named `{world}` in package"))
+            .ok_or_else(|| anyhow!("no world named `{world_name}` in package"))
     }
 
     /// Assigns a human readable name to the `WorldKey` specified.
@@ -841,7 +1207,7 @@ impl Resolve {
                     .iter()
                     .chain(world.exports.iter())
                     .filter_map(move |(_name, item)| match item {
-                        WorldItem::Interface(id) => Some(*id),
+                        WorldItem::Interface { id, .. } => Some(*id),
                         WorldItem::Function(_) => None,
                         WorldItem::Type(t) => self.type_interface_dep(*t),
                     })
@@ -937,7 +1303,7 @@ impl Resolve {
             for (name, item) in world.imports.iter().chain(world.exports.iter()) {
                 log::debug!("validating world item: {}", self.name_world_key(name));
                 match item {
-                    WorldItem::Interface(_) => {}
+                    WorldItem::Interface { .. } => {}
                     WorldItem::Function(f) => {
                         assert_eq!(f.name, name.clone().unwrap_name());
                     }
@@ -998,7 +1364,7 @@ impl Resolve {
 
             for (_, item) in world.imports.iter().chain(&world.exports) {
                 let id = match item {
-                    WorldItem::Interface(id) => *id,
+                    WorldItem::Interface { id, .. } => *id,
                     _ => continue,
                 };
                 let other_package = self.interfaces[id].package;
@@ -1049,6 +1415,7 @@ impl Resolve {
             name: None,
             docs: Docs::default(),
             owner: TypeOwner::None,
+            stability: Stability::Unknown,
         })));
 
         self.types.alloc(TypeDef {
@@ -1056,6 +1423,7 @@ impl Resolve {
             name: None,
             docs: Docs::default(),
             owner: TypeOwner::None,
+            stability: Stability::Unknown,
         });
 
         let types = self
@@ -1075,6 +1443,7 @@ impl Resolve {
                         name: None,
                         docs: Docs::default(),
                         owner: TypeOwner::None,
+                        stability: Stability::Unknown,
                     });
                 }
                 TypeDefKind::Stream(ty) => {
@@ -1083,18 +1452,21 @@ impl Resolve {
                         name: None,
                         docs: Docs::default(),
                         owner: TypeOwner::None,
+                        stability: Stability::Unknown,
                     })));
                     let result = Type::Id(self.types.alloc(TypeDef {
                         kind: TypeDefKind::Result(Result_ { ok, err }),
                         name: None,
                         docs: Docs::default(),
                         owner: TypeOwner::None,
+                        stability: Stability::Unknown,
                     }));
                     self.types.alloc(TypeDef {
                         kind: TypeDefKind::Option(result),
                         name: None,
                         docs: Docs::default(),
                         owner: TypeOwner::None,
+                        stability: Stability::Unknown,
                     });
                 }
                 _ => unreachable!(),
@@ -1175,15 +1547,21 @@ impl Resolve {
 
         (unit_result, payload_results)
     }
+    fn include_stability(&self, stability: &Stability) -> bool {
+        match stability {
+            Stability::Stable { .. } | Stability::Unknown => true,
+            Stability::Unstable { feature } => self.features.contains(feature) || self.all_features,
+        }
+    }
 }
 
 /// Structure returned by [`Resolve::merge`] which contains mappings from
 /// old-ids to new-ids after the merge.
 #[derive(Default)]
 pub struct Remap {
-    pub types: Vec<TypeId>,
-    pub interfaces: Vec<InterfaceId>,
-    pub worlds: Vec<WorldId>,
+    pub types: Vec<Option<TypeId>>,
+    pub interfaces: Vec<Option<InterfaceId>>,
+    pub worlds: Vec<Option<WorldId>>,
     pub packages: Vec<PackageId>,
 
     /// A cache of anonymous `own<T>` handles for resource types.
@@ -1196,9 +1574,40 @@ pub struct Remap {
     /// The key of this map is the resource id `T` in the new resolve, and
     /// the value is the `own<T>` type pointing to `T`.
     own_handles: HashMap<TypeId, TypeId>,
+
+    type_has_borrow: Vec<Option<bool>>,
+}
+
+fn apply_map<T>(map: &[Option<Id<T>>], id: Id<T>, desc: &str, span: Option<Span>) -> Result<Id<T>> {
+    match map.get(id.index()) {
+        Some(Some(id)) => Ok(*id),
+        Some(None) => {
+            let msg = format!(
+                "found a reference to a {desc} which is excluded \
+                 due to its feature not being activated"
+            );
+            match span {
+                Some(span) => Err(Error::new(span, msg).into()),
+                None => bail!("{msg}"),
+            }
+        }
+        None => panic!("request to remap a {desc} that has not yet been registered"),
+    }
 }
 
 impl Remap {
+    pub fn map_type(&self, id: TypeId, span: Option<Span>) -> Result<TypeId> {
+        apply_map(&self.types, id, "type", span)
+    }
+
+    pub fn map_interface(&self, id: InterfaceId, span: Option<Span>) -> Result<InterfaceId> {
+        apply_map(&self.interfaces, id, "interface", span)
+    }
+
+    pub fn map_world(&self, id: WorldId, span: Option<Span>) -> Result<WorldId> {
+        apply_map(&self.worlds, id, "world", span)
+    }
+
     fn append(
         &mut self,
         resolve: &mut Resolve,
@@ -1210,13 +1619,33 @@ impl Remap {
         let foreign_interfaces = self.interfaces.len();
         let foreign_worlds = self.worlds.len();
 
+        let pkgid = resolve.packages.alloc(Package {
+            name: unresolved.name.clone(),
+            docs: unresolved.docs.clone(),
+            interfaces: Default::default(),
+            worlds: Default::default(),
+        });
+        let prev = resolve.package_names.insert(unresolved.name.clone(), pkgid);
+        assert!(prev.is_none());
+
         // Copy over all types first, updating any intra-type references. Note
         // that types are sorted topologically which means this iteration
         // order should be sufficient. Also note though that the interface
         // owner of a type isn't updated here due to interfaces not being known
         // yet.
-        for (id, mut ty) in unresolved.types.into_iter().skip(foreign_types) {
-            self.update_typedef(resolve, &mut ty);
+        assert_eq!(unresolved.types.len(), unresolved.type_spans.len());
+        for ((id, mut ty), span) in unresolved
+            .types
+            .into_iter()
+            .zip(&unresolved.type_spans)
+            .skip(foreign_types)
+        {
+            if !resolve.include_stability(&ty.stability) {
+                self.types.push(None);
+                continue;
+            }
+
+            self.update_typedef(resolve, &mut ty, Some(*span))?;
             let new_id = resolve.types.alloc(ty);
             assert_eq!(self.types.len(), id.index());
 
@@ -1230,29 +1659,55 @@ impl Remap {
                     owner: TypeOwner::None,
                     kind: TypeDefKind::Handle(Handle::Own(id)),
                     docs: _,
+                    stability: _,
                 } => *self.own_handles.entry(id).or_insert(new_id),
 
                 // Everything not-related to `own<T>` doesn't get its ID
                 // modified.
                 _ => new_id,
             };
-            self.types.push(new_id);
+            self.types.push(Some(new_id));
         }
 
         // Next transfer all interfaces into `Resolve`, updating type ids
         // referenced along the way.
-        for (id, mut iface) in unresolved.interfaces.into_iter().skip(foreign_interfaces) {
-            self.update_interface(resolve, &mut iface);
+        assert_eq!(
+            unresolved.interfaces.len(),
+            unresolved.interface_spans.len()
+        );
+        for ((id, mut iface), span) in unresolved
+            .interfaces
+            .into_iter()
+            .zip(&unresolved.interface_spans)
+            .skip(foreign_interfaces)
+        {
+            if !resolve.include_stability(&iface.stability) {
+                self.interfaces.push(None);
+                continue;
+            }
+            self.update_interface(resolve, &mut iface, Some(span))?;
+            assert!(iface.package.is_none());
+            iface.package = Some(pkgid);
             let new_id = resolve.interfaces.alloc(iface);
             assert_eq!(self.interfaces.len(), id.index());
-            self.interfaces.push(new_id);
+            self.interfaces.push(Some(new_id));
         }
 
         // Now that interfaces are identified go back through the types and
         // update their interface owners.
-        for id in self.types.iter().skip(foreign_types) {
-            match &mut resolve.types[*id].owner {
-                TypeOwner::Interface(id) => *id = self.interfaces[id.index()],
+        for (i, id) in self.types.iter().enumerate().skip(foreign_types) {
+            let id = match id {
+                Some(id) => *id,
+                None => continue,
+            };
+            match &mut resolve.types[id].owner {
+                TypeOwner::Interface(id) => {
+                    let span = unresolved.type_spans[i];
+                    *id = self.map_interface(*id, Some(span))
+                        .with_context(|| {
+                            "this type is not gated by a feature but its interface is gated by a feature"
+                        })?;
+                }
                 TypeOwner::World(_) | TypeOwner::None => {}
             }
         }
@@ -1264,58 +1719,65 @@ impl Remap {
         // This is done after types/interfaces are fully settled so the
         // transitive relation between interfaces, through types, is understood
         // here.
-        assert_eq!(unresolved.worlds.len(), unresolved.world_item_spans.len());
-        let include_world_spans = unresolved.include_world_spans;
-        for ((id, mut world), (import_spans, export_spans)) in unresolved
+        assert_eq!(unresolved.worlds.len(), unresolved.world_spans.len());
+        for ((id, mut world), span) in unresolved
             .worlds
             .into_iter()
-            .zip(unresolved.world_item_spans)
+            .zip(unresolved.world_spans)
             .skip(foreign_worlds)
         {
-            self.update_world(
-                &mut world,
-                resolve,
-                &import_spans,
-                &export_spans,
-                &include_world_spans,
-            )?;
+            if !resolve.include_stability(&world.stability) {
+                self.worlds.push(None);
+                continue;
+            }
+            self.update_world(&mut world, resolve, &span)?;
 
             let new_id = resolve.worlds.alloc(world);
             assert_eq!(self.worlds.len(), id.index());
-            self.worlds.push(new_id);
+            self.worlds.push(Some(new_id));
         }
 
         // As with interfaces, now update the ids of world-owned types.
-        for id in self.types.iter().skip(foreign_types) {
-            match &mut resolve.types[*id].owner {
-                TypeOwner::World(id) => *id = self.worlds[id.index()],
+        for (i, id) in self.types.iter().enumerate().skip(foreign_types) {
+            let id = match id {
+                Some(id) => *id,
+                None => continue,
+            };
+            match &mut resolve.types[id].owner {
+                TypeOwner::World(id) => {
+                    let span = unresolved.type_spans[i];
+                    *id = self.map_world(*id, Some(span))
+                        .with_context(|| {
+                            "this type is not gated by a feature but its interface is gated by a feature"
+                        })?;
+                }
                 TypeOwner::Interface(_) | TypeOwner::None => {}
             }
         }
 
         // Fixup "parent" ids now that everything has been identified
-        let pkgid = resolve.packages.alloc(Package {
-            name: unresolved.name.clone(),
-            docs: unresolved.docs.clone(),
-            interfaces: Default::default(),
-            worlds: Default::default(),
-        });
-        let prev = resolve.package_names.insert(unresolved.name.clone(), pkgid);
-        assert!(prev.is_none());
         for id in self.interfaces.iter().skip(foreign_interfaces) {
-            let iface = &mut resolve.interfaces[*id];
+            let id = match id {
+                Some(id) => *id,
+                None => continue,
+            };
+            let iface = &mut resolve.interfaces[id];
             iface.package = Some(pkgid);
             if let Some(name) = &iface.name {
-                let prev = resolve.packages[pkgid].interfaces.insert(name.clone(), *id);
+                let prev = resolve.packages[pkgid].interfaces.insert(name.clone(), id);
                 assert!(prev.is_none());
             }
         }
         for id in self.worlds.iter().skip(foreign_worlds) {
-            let world = &mut resolve.worlds[*id];
+            let id = match id {
+                Some(id) => *id,
+                None => continue,
+            };
+            let world = &mut resolve.worlds[id];
             world.package = Some(pkgid);
             let prev = resolve.packages[pkgid]
                 .worlds
-                .insert(world.name.clone(), *id);
+                .insert(world.name.clone(), id);
             assert!(prev.is_none());
         }
         Ok(pkgid)
@@ -1366,15 +1828,15 @@ impl Remap {
         self.process_foreign_types(unresolved, resolve)?;
 
         for (id, span) in unresolved.required_resource_types.iter() {
-            let mut id = self.types[id.index()];
+            let mut id = self.map_type(*id, Some(*span))?;
             loop {
                 match resolve.types[id].kind {
                     TypeDefKind::Type(Type::Id(i)) => id = i,
                     TypeDefKind::Resource => break,
-                    _ => bail!(Error {
-                        span: *span,
-                        msg: format!("type used in a handle must be a resource"),
-                    }),
+                    _ => bail!(Error::new(
+                        *span,
+                        format!("type used in a handle must be a resource"),
+                    )),
                 }
             }
         }
@@ -1400,26 +1862,20 @@ impl Remap {
                 .package_names
                 .get(pkg_name)
                 .copied()
-                .ok_or_else(|| Error {
-                    span,
-                    msg: format!("package not found"),
-                })?;
+                .ok_or_else(|| Error::new(span, "package not found"))?;
 
             // Functions can't be imported so this should be empty.
             assert!(unresolved_iface.functions.is_empty());
 
             let pkg = &resolve.packages[pkgid];
-            let span = unresolved.interface_spans[unresolved_iface_id.index()];
+            let span = &unresolved.interface_spans[unresolved_iface_id.index()];
             let iface_id = pkg
                 .interfaces
                 .get(interface)
                 .copied()
-                .ok_or_else(|| Error {
-                    span,
-                    msg: format!("interface not found in package"),
-                })?;
+                .ok_or_else(|| Error::new(span.span, "interface not found in package"))?;
             assert_eq!(self.interfaces.len(), unresolved_iface_id.index());
-            self.interfaces.push(iface_id);
+            self.interfaces.push(Some(iface_id));
         }
         for (id, _) in unresolved.interfaces.iter().skip(self.interfaces.len()) {
             assert!(
@@ -1448,18 +1904,16 @@ impl Remap {
                 .package_names
                 .get(pkg_name)
                 .copied()
-                .ok_or_else(|| Error {
-                    span,
-                    msg: format!("package not found"),
-                })?;
+                .ok_or_else(|| Error::new(span, "package not found"))?;
             let pkg = &resolve.packages[pkgid];
-            let span = unresolved.world_spans[unresolved_world_id.index()];
-            let world_id = pkg.worlds.get(world).copied().ok_or_else(|| Error {
-                span,
-                msg: format!("world not found in package"),
-            })?;
+            let span = &unresolved.world_spans[unresolved_world_id.index()];
+            let world_id = pkg
+                .worlds
+                .get(world)
+                .copied()
+                .ok_or_else(|| Error::new(span.span, "world not found in package"))?;
             assert_eq!(self.worlds.len(), unresolved_world_id.index());
-            self.worlds.push(world_id);
+            self.worlds.push(Some(world_id));
         }
         for (id, _) in unresolved.worlds.iter().skip(self.worlds.len()) {
             assert!(
@@ -1487,18 +1941,17 @@ impl Remap {
                 TypeOwner::Interface(id) => id,
                 _ => unreachable!(),
             };
-            let iface_id = self.interfaces[unresolved_iface_id.index()];
+            let iface_id = self.map_interface(unresolved_iface_id, None)?;
             let name = unresolved_ty.name.as_ref().unwrap();
             let span = unresolved.unknown_type_spans[unresolved_type_id.index()];
             let type_id = *resolve.interfaces[iface_id]
                 .types
                 .get(name)
-                .ok_or_else(|| Error {
-                    span,
-                    msg: format!("type `{name}` not defined in interface"),
+                .ok_or_else(|| {
+                    Error::new(span, format!("type `{name}` not defined in interface"))
                 })?;
             assert_eq!(self.types.len(), unresolved_type_id.index());
-            self.types.push(type_id);
+            self.types.push(Some(type_id));
         }
         for (_, ty) in unresolved.types.iter().skip(self.types.len()) {
             if let TypeDefKind::Unknown = ty.kind {
@@ -1508,49 +1961,58 @@ impl Remap {
         Ok(())
     }
 
-    fn update_typedef(&mut self, resolve: &mut Resolve, ty: &mut TypeDef) {
+    fn update_typedef(
+        &mut self,
+        resolve: &mut Resolve,
+        ty: &mut TypeDef,
+        span: Option<Span>,
+    ) -> Result<()> {
         // NB: note that `ty.owner` is not updated here since interfaces
         // haven't been mapped yet and that's done in a separate step.
         use crate::TypeDefKind::*;
         match &mut ty.kind {
             Handle(handle) => match handle {
-                crate::Handle::Own(ty) | crate::Handle::Borrow(ty) => self.update_type_id(ty),
+                crate::Handle::Own(ty) | crate::Handle::Borrow(ty) => {
+                    self.update_type_id(ty, span)?
+                }
             },
             Resource => {}
             Record(r) => {
                 for field in r.fields.iter_mut() {
-                    self.update_ty(resolve, &mut field.ty);
+                    self.update_ty(resolve, &mut field.ty, span)
+                        .with_context(|| format!("failed to update field `{}`", field.name))?;
                 }
             }
             Tuple(t) => {
                 for ty in t.types.iter_mut() {
-                    self.update_ty(resolve, ty);
+                    self.update_ty(resolve, ty, span)?;
                 }
             }
             Variant(v) => {
                 for case in v.cases.iter_mut() {
                     if let Some(t) = &mut case.ty {
-                        self.update_ty(resolve, t);
+                        self.update_ty(resolve, t, span)?;
                     }
                 }
             }
-            Option(t) | List(t) | Stream(t) => self.update_ty(resolve, t),
+            Option(t) | Stream(t) => self.update_ty(resolve, t, span)?,
             Result(r) => {
                 if let Some(ty) = &mut r.ok {
-                    self.update_ty(resolve, ty);
+                    self.update_ty(resolve, ty, span)?;
                 }
                 if let Some(ty) = &mut r.err {
-                    self.update_ty(resolve, ty);
+                    self.update_ty(resolve, ty, span)?;
                 }
             }
-            Future(Some(t)) => self.update_ty(resolve, t),
             Error => {}
+            List(t) => self.update_ty(resolve, t, span)?,
+            Future(Some(t)) => self.update_ty(resolve, t, span)?,
 
             // Note that `update_ty` is specifically not used here as typedefs
             // because for the `type a = b` form that doesn't force `a` to be a
             // handle type if `b` is a resource type, instead `a` is
             // simultaneously usable as a resource and a handle type
-            Type(crate::Type::Id(id)) => self.update_type_id(id),
+            Type(crate::Type::Id(id)) => self.update_type_id(id, span)?,
             Type(_) => {}
 
             // nothing to do for these as they're just names or empty
@@ -1558,14 +2020,21 @@ impl Remap {
 
             Unknown => unreachable!(),
         }
+
+        Ok(())
     }
 
-    fn update_ty(&mut self, resolve: &mut Resolve, ty: &mut Type) {
+    fn update_ty(
+        &mut self,
+        resolve: &mut Resolve,
+        ty: &mut Type,
+        span: Option<Span>,
+    ) -> Result<()> {
         let id = match ty {
             Type::Id(id) => id,
-            _ => return,
+            _ => return Ok(()),
         };
-        self.update_type_id(id);
+        self.update_type_id(id, span)?;
 
         // If `id` points to a `Resource` type then this means that what was
         // just discovered was a reference to what will implicitly become an
@@ -1587,53 +2056,98 @@ impl Remap {
                     owner: TypeOwner::None,
                     kind: TypeDefKind::Handle(Handle::Own(*id)),
                     docs: Default::default(),
+                    stability: Default::default(),
                 })
             });
         }
+        Ok(())
     }
 
-    fn update_type_id(&self, id: &mut TypeId) {
-        *id = self.types[id.index()];
+    fn update_type_id(&self, id: &mut TypeId, span: Option<Span>) -> Result<()> {
+        *id = self.map_type(*id, span)?;
+        Ok(())
     }
 
-    fn update_interface(&mut self, resolve: &mut Resolve, iface: &mut Interface) {
+    fn update_interface(
+        &mut self,
+        resolve: &mut Resolve,
+        iface: &mut Interface,
+        spans: Option<&InterfaceSpan>,
+    ) -> Result<()> {
+        iface.types.retain(|_, ty| self.types[ty.index()].is_some());
+
         // NB: note that `iface.doc` is not updated here since interfaces
         // haven't been mapped yet and that's done in a separate step.
         for (_name, ty) in iface.types.iter_mut() {
-            self.update_type_id(ty);
+            self.update_type_id(ty, spans.map(|s| s.span))?;
         }
-        for (_, func) in iface.functions.iter_mut() {
-            self.update_function(resolve, func);
+        if let Some(spans) = spans {
+            assert_eq!(iface.functions.len(), spans.funcs.len());
         }
+        for (i, (_, func)) in iface.functions.iter_mut().enumerate() {
+            if !resolve.include_stability(&func.stability) {
+                continue;
+            }
+            let span = spans.map(|s| s.funcs[i]);
+            self.update_function(resolve, func, span)
+                .with_context(|| format!("failed to update function `{}`", func.name))?;
+        }
+        iface
+            .functions
+            .retain(|_, f| resolve.include_stability(&f.stability));
+        Ok(())
     }
 
-    fn update_function(&mut self, resolve: &mut Resolve, func: &mut Function) {
+    fn update_function(
+        &mut self,
+        resolve: &mut Resolve,
+        func: &mut Function,
+        span: Option<Span>,
+    ) -> Result<()> {
         match &mut func.kind {
             FunctionKind::Freestanding => {}
             FunctionKind::Method(id) | FunctionKind::Constructor(id) | FunctionKind::Static(id) => {
-                self.update_type_id(id);
+                self.update_type_id(id, span)?;
             }
         }
         for (_, ty) in func.params.iter_mut() {
-            self.update_ty(resolve, ty);
+            self.update_ty(resolve, ty, span)?;
         }
         match &mut func.results {
             Results::Named(named) => {
                 for (_, ty) in named.iter_mut() {
-                    self.update_ty(resolve, ty);
+                    self.update_ty(resolve, ty, span)?;
                 }
             }
-            Results::Anon(ty) => self.update_ty(resolve, ty),
+            Results::Anon(ty) => self.update_ty(resolve, ty, span)?,
         }
+
+        for ty in func.results.iter_types() {
+            if !self.type_has_borrow(resolve, ty) {
+                continue;
+            }
+            match span {
+                Some(span) => {
+                    bail!(Error::new(
+                        span,
+                        format!(
+                            "function returns a type which contains \
+                             a `borrow<T>` which is not supported"
+                        )
+                    ))
+                }
+                None => unreachable!(),
+            }
+        }
+
+        Ok(())
     }
 
     fn update_world(
         &mut self,
         world: &mut World,
         resolve: &mut Resolve,
-        import_spans: &[Span],
-        export_spans: &[Span],
-        include_world_spans: &[Span],
+        spans: &WorldSpan,
     ) -> Result<()> {
         // NB: this function is more more complicated than the prior versions
         // of merging an item because this is the location that elaboration of
@@ -1641,8 +2155,8 @@ impl Remap {
         // knowledge of all interfaces a worlds imports, for example, are
         // expanded fully to ensure that all transitive items are necessarily
         // imported.
-        assert_eq!(world.imports.len(), import_spans.len());
-        assert_eq!(world.exports.len(), export_spans.len());
+        assert_eq!(world.imports.len(), spans.imports.len());
+        assert_eq!(world.exports.len(), spans.exports.len());
 
         // First up, process all the `imports` of the world. Note that this
         // starts by gutting the list of imports stored in `world` to get
@@ -1653,20 +2167,30 @@ impl Remap {
         // determining names later on.
         let mut import_funcs = Vec::new();
         let mut import_types = Vec::new();
-        for ((mut name, item), span) in mem::take(&mut world.imports).into_iter().zip(import_spans)
+        for ((mut name, mut item), span) in mem::take(&mut world.imports)
+            .into_iter()
+            .zip(&spans.imports)
         {
-            self.update_world_key(&mut name);
+            // Update the `id` eagerly here so `item.stability(..)` below
+            // works.
+            if let WorldItem::Type(id) = &mut item {
+                *id = self.map_type(*id, Some(*span))?;
+            }
+            let stability = item.stability(resolve);
+            if !resolve.include_stability(stability) {
+                continue;
+            }
+            self.update_world_key(&mut name, Some(*span))?;
             match item {
-                WorldItem::Interface(id) => {
-                    let id = self.interfaces[id.index()];
-                    self.add_world_import(resolve, world, name, id);
+                WorldItem::Interface { id, stability } => {
+                    let id = self.map_interface(id, Some(*span))?;
+                    self.add_world_import(resolve, world, name, id, &stability);
                 }
                 WorldItem::Function(mut f) => {
-                    self.update_function(resolve, &mut f);
+                    self.update_function(resolve, &mut f, Some(*span))?;
                     import_funcs.push((name.unwrap_name(), f, *span));
                 }
                 WorldItem::Type(id) => {
-                    let id = self.types[id.index()];
                     import_types.push((name.unwrap_name(), id, *span));
                 }
             }
@@ -1676,24 +2200,36 @@ impl Remap {
             if let TypeDefKind::Type(Type::Id(other)) = resolve.types[*id].kind {
                 if let TypeOwner::Interface(owner) = resolve.types[other].owner {
                     let name = WorldKey::Interface(owner);
-                    self.add_world_import(resolve, world, name, owner);
+                    self.add_world_import(
+                        resolve,
+                        world,
+                        name,
+                        owner,
+                        &resolve.types[*id].stability,
+                    );
                 }
             }
         }
 
         let mut export_funcs = Vec::new();
         let mut export_interfaces = IndexMap::new();
-        for ((mut name, item), span) in mem::take(&mut world.exports).into_iter().zip(export_spans)
+        for ((mut name, item), span) in mem::take(&mut world.exports)
+            .into_iter()
+            .zip(&spans.exports)
         {
-            self.update_world_key(&mut name);
+            let stability = item.stability(resolve);
+            if !resolve.include_stability(stability) {
+                continue;
+            }
+            self.update_world_key(&mut name, Some(*span))?;
             match item {
-                WorldItem::Interface(id) => {
-                    let id = self.interfaces[id.index()];
-                    let prev = export_interfaces.insert(id, (name, *span));
+                WorldItem::Interface { id, stability } => {
+                    let id = self.map_interface(id, Some(*span))?;
+                    let prev = export_interfaces.insert(id, (name, *span, stability));
                     assert!(prev.is_none());
                 }
                 WorldItem::Function(mut f) => {
-                    self.update_function(resolve, &mut f);
+                    self.update_function(resolve, &mut f, Some(*span))?;
                     let name = match name {
                         WorldKey::Name(name) => name,
                         WorldKey::Interface(_) => unreachable!(),
@@ -1707,12 +2243,18 @@ impl Remap {
         self.add_world_exports(resolve, world, &export_interfaces)?;
 
         // Resolve all includes of the world
+        assert_eq!(world.includes.len(), spans.includes.len());
         let includes = mem::take(&mut world.includes);
         let include_names = mem::take(&mut world.include_names);
-        for (index, include_world) in includes.into_iter().enumerate() {
-            let span = include_world_spans[index];
-            let names = &include_names[index];
-            self.resolve_include(world, include_world, names, span, resolve)?;
+        for (((stability, include_world), span), names) in includes
+            .into_iter()
+            .zip(&spans.includes)
+            .zip(&include_names)
+        {
+            if !resolve.include_stability(&stability) {
+                continue;
+            }
+            self.resolve_include(world, include_world, names, *span, resolve)?;
         }
 
         for (name, id, span) in import_types {
@@ -1720,10 +2262,10 @@ impl Remap {
                 .imports
                 .insert(WorldKey::Name(name.clone()), WorldItem::Type(id));
             if prev.is_some() {
-                bail!(Error {
-                    msg: format!("export of type `{name}` shadows previously imported interface"),
+                bail!(Error::new(
                     span,
-                })
+                    format!("export of type `{name}` shadows previously imported interface"),
+                ))
             }
         }
 
@@ -1732,12 +2274,10 @@ impl Remap {
                 .imports
                 .insert(WorldKey::Name(name.clone()), WorldItem::Function(func));
             if prev.is_some() {
-                bail!(Error {
-                    msg: format!(
-                        "import of function `{name}` shadows previously imported interface"
-                    ),
+                bail!(Error::new(
                     span,
-                })
+                    format!("import of function `{name}` shadows previously imported interface"),
+                ))
             }
         }
 
@@ -1746,12 +2286,10 @@ impl Remap {
                 .exports
                 .insert(WorldKey::Name(name.clone()), WorldItem::Function(func));
             if prev.is_some() {
-                bail!(Error {
-                    msg: format!(
-                        "export of function `{name}` shadows previously exported interface"
-                    ),
+                bail!(Error::new(
                     span,
-                })
+                    format!("export of function `{name}` shadows previously exported interface"),
+                ))
             }
         }
 
@@ -1776,7 +2314,7 @@ impl Remap {
             let rank = |item: &WorldItem| match item {
                 WorldItem::Type(_) => unreachable!(),
                 WorldItem::Function(_) => 0,
-                WorldItem::Interface(_) => 1,
+                WorldItem::Interface { .. } => 1,
             };
             rank(a).cmp(&rank(b))
         });
@@ -1787,13 +2325,14 @@ impl Remap {
         Ok(())
     }
 
-    fn update_world_key(&self, key: &mut WorldKey) {
+    fn update_world_key(&self, key: &mut WorldKey, span: Option<Span>) -> Result<()> {
         match key {
             WorldKey::Name(_) => {}
             WorldKey::Interface(id) => {
-                *id = self.interfaces[id.index()];
+                *id = self.map_interface(*id, span)?;
             }
         }
+        Ok(())
     }
 
     fn add_world_import(
@@ -1802,14 +2341,21 @@ impl Remap {
         world: &mut World,
         key: WorldKey,
         id: InterfaceId,
+        stability: &Stability,
     ) {
         if world.imports.contains_key(&key) {
             return;
         }
         for dep in resolve.interface_direct_deps(id) {
-            self.add_world_import(resolve, world, WorldKey::Interface(dep), dep);
+            self.add_world_import(resolve, world, WorldKey::Interface(dep), dep, stability);
         }
-        let prev = world.imports.insert(key, WorldItem::Interface(id));
+        let prev = world.imports.insert(
+            key,
+            WorldItem::Interface {
+                id,
+                stability: stability.clone(),
+            },
+        );
         assert!(prev.is_none());
     }
 
@@ -1863,10 +2409,10 @@ impl Remap {
         &self,
         resolve: &Resolve,
         world: &mut World,
-        export_interfaces: &IndexMap<InterfaceId, (WorldKey, Span)>,
+        export_interfaces: &IndexMap<InterfaceId, (WorldKey, Span, Stability)>,
     ) -> Result<()> {
         let mut required_imports = HashSet::new();
-        for (id, (key, span)) in export_interfaces.iter() {
+        for (id, (key, span, stability)) in export_interfaces.iter() {
             let ok = add_world_export(
                 resolve,
                 world,
@@ -1875,9 +2421,11 @@ impl Remap {
                 *id,
                 key,
                 true,
+                &stability,
             );
             if !ok {
-                bail!(Error {
+                bail!(Error::new(
+                    *span,
                     // FIXME: this is not a great error message and basically no
                     // one will know what to do when it gets printed. Improving
                     // this error message, however, is a chunk of work that may
@@ -1895,12 +2443,11 @@ impl Remap {
                     // more refactoring, so it's left to a future date in the
                     // hopes that most folks won't actually run into this for
                     // the time being.
-                    msg: format!(
+                    format!(
                         "interface transitively depends on an interface in \
                          incompatible ways",
                     ),
-                    span: *span,
-                });
+                ));
             }
         }
         return Ok(());
@@ -1908,11 +2455,12 @@ impl Remap {
         fn add_world_export(
             resolve: &Resolve,
             world: &mut World,
-            export_interfaces: &IndexMap<InterfaceId, (WorldKey, Span)>,
+            export_interfaces: &IndexMap<InterfaceId, (WorldKey, Span, Stability)>,
             required_imports: &mut HashSet<InterfaceId>,
             id: InterfaceId,
             key: &WorldKey,
             add_export: bool,
+            stability: &Stability,
         ) -> bool {
             if world.exports.contains_key(key) {
                 if add_export {
@@ -1937,19 +2485,24 @@ impl Remap {
                     dep,
                     &key,
                     add_export,
+                    stability,
                 )
             });
             if !ok {
                 return false;
             }
+            let item = WorldItem::Interface {
+                id,
+                stability: stability.clone(),
+            };
             if add_export {
                 if required_imports.contains(&id) {
                     return false;
                 }
-                world.exports.insert(key.clone(), WorldItem::Interface(id));
+                world.exports.insert(key.clone(), item);
             } else {
                 required_imports.insert(id);
-                world.imports.insert(key.clone(), WorldItem::Interface(id));
+                world.imports.insert(key.clone(), item);
             }
             true
         }
@@ -1963,7 +2516,7 @@ impl Remap {
         span: Span,
         resolve: &Resolve,
     ) -> Result<()> {
-        let include_world_id = self.worlds[include_world.index()];
+        let include_world_id = self.map_world(include_world, Some(span))?;
         let include_world = &resolve.worlds[include_world_id];
         let mut names_ = names.to_owned();
 
@@ -1975,10 +2528,10 @@ impl Remap {
             self.remove_matching_name(export, &mut names_);
         }
         if !names_.is_empty() {
-            bail!(Error {
-                msg: format!("no import or export kebab-name `{}`. Note that an ID does not support renaming", names_[0].name),
-                span: span,
-            });
+            bail!(Error::new(
+                span,
+                format!("no import or export kebab-name `{}`. Note that an ID does not support renaming", names_[0].name),
+            ));
         }
 
         // copy the imports and exports from the included world into the current world
@@ -2013,16 +2566,31 @@ impl Remap {
 
                 let prev = items.insert(WorldKey::Name(n.clone()), item.1.clone());
                 if prev.is_some() {
-                    bail!(Error {
-                        msg: format!("{item_type} of `{n}` shadows previously {item_type}ed items"),
+                    bail!(Error::new(
                         span,
-                    })
+                        format!("{item_type} of `{n}` shadows previously {item_type}ed items"),
+                    ))
                 }
             }
-            key => {
-                let prev = items.insert(key.clone(), item.1.clone());
-                if let Some(prev) = prev {
-                    assert_eq!(prev, item.1.clone());
+            key @ WorldKey::Interface(_) => {
+                let prev = items.entry(key.clone()).or_insert(item.1.clone());
+                match (&item.1, prev) {
+                    (
+                        WorldItem::Interface {
+                            id: aid,
+                            stability: astability,
+                        },
+                        WorldItem::Interface {
+                            id: bid,
+                            stability: bstability,
+                        },
+                    ) => {
+                        assert_eq!(*aid, *bid);
+                        update_stability(astability, bstability)?;
+                    }
+                    (WorldItem::Interface { .. }, _) => unreachable!(),
+                    (WorldItem::Function(_), _) => unreachable!(),
+                    (WorldItem::Type(_), _) => unreachable!(),
                 }
             }
         };
@@ -2035,6 +2603,56 @@ impl Remap {
                 names.retain(|name| name.name != n.clone());
             }
             _ => {}
+        }
+    }
+
+    fn type_has_borrow(&mut self, resolve: &Resolve, ty: &Type) -> bool {
+        let id = match ty {
+            Type::Id(id) => *id,
+            _ => return false,
+        };
+
+        if let Some(Some(has_borrow)) = self.type_has_borrow.get(id.index()) {
+            return *has_borrow;
+        }
+
+        let result = self.typedef_has_borrow(resolve, &resolve.types[id]);
+        if self.type_has_borrow.len() <= id.index() {
+            self.type_has_borrow.resize(id.index() + 1, None);
+        }
+        self.type_has_borrow[id.index()] = Some(result);
+        result
+    }
+
+    fn typedef_has_borrow(&mut self, resolve: &Resolve, ty: &TypeDef) -> bool {
+        match &ty.kind {
+            TypeDefKind::Type(t) => self.type_has_borrow(resolve, t),
+            TypeDefKind::Variant(v) => v
+                .cases
+                .iter()
+                .filter_map(|case| case.ty.as_ref())
+                .any(|ty| self.type_has_borrow(resolve, ty)),
+            TypeDefKind::Handle(Handle::Borrow(_)) => true,
+            TypeDefKind::Handle(Handle::Own(_)) => false,
+            TypeDefKind::Resource => false,
+            TypeDefKind::Record(r) => r
+                .fields
+                .iter()
+                .any(|case| self.type_has_borrow(resolve, &case.ty)),
+            TypeDefKind::Flags(_) => false,
+            TypeDefKind::Tuple(t) => t.types.iter().any(|t| self.type_has_borrow(resolve, t)),
+            TypeDefKind::Enum(_) => false,
+            TypeDefKind::List(ty) | TypeDefKind::Future(Some(ty)) | TypeDefKind::Option(ty) => {
+                self.type_has_borrow(resolve, ty)
+            }
+            TypeDefKind::Result(r) => [&r.ok, &r.err]
+                .iter()
+                .filter_map(|t| t.as_ref())
+                .any(|t| self.type_has_borrow(resolve, t)),
+            TypeDefKind::Stream(r) => self.type_has_borrow(resolve, r),
+            TypeDefKind::Future(None) => false,
+            TypeDefKind::Unknown => unreachable!(),
+            TypeDefKind::Error => todo!(),
         }
     }
 }
@@ -2074,8 +2692,8 @@ struct MergeMap<'a> {
 }
 
 impl<'a> MergeMap<'a> {
-    fn new(from: &'a Resolve, into: &'a Resolve) -> Result<MergeMap<'a>> {
-        Ok(MergeMap {
+    fn new(from: &'a Resolve, into: &'a Resolve) -> MergeMap<'a> {
+        MergeMap {
             package_map: Default::default(),
             interface_map: Default::default(),
             type_map: Default::default(),
@@ -2084,7 +2702,7 @@ impl<'a> MergeMap<'a> {
             worlds_to_add: Default::default(),
             from,
             into,
-        })
+        }
     }
 
     fn build(&mut self) -> Result<()> {
@@ -2183,21 +2801,90 @@ impl<'a> MergeMap<'a> {
             let prev = self.type_map.insert(*from_type_id, into_type_id);
             assert!(prev.is_none());
 
-            // FIXME: ideally the types should be "structurally
-            // equal" but that's not trivial to do in the face of
-            // resources.
+            self.build_type_id(*from_type_id, into_type_id)
+                .with_context(|| format!("mismatch in type `{name}`"))?;
         }
 
-        for (name, _) in from_interface.functions.iter() {
-            if !into_interface.functions.contains_key(name) {
-                bail!("expected function `{name}` to be present");
+        for (name, from_func) in from_interface.functions.iter() {
+            let into_func = match into_interface.functions.get(name) {
+                Some(func) => func,
+                None => bail!("expected function `{name}` to be present"),
+            };
+            self.build_function(from_func, into_func)
+                .with_context(|| format!("mismatch in function `{name}`"))?;
+        }
+
+        Ok(())
+    }
+
+    fn build_type_id(&mut self, from_id: TypeId, into_id: TypeId) -> Result<()> {
+        // FIXME: ideally the types should be "structurally
+        // equal" but that's not trivial to do in the face of
+        // resources.
+        let _ = from_id;
+        let _ = into_id;
+        Ok(())
+    }
+
+    fn build_type(&mut self, from_ty: &Type, into_ty: &Type) -> Result<()> {
+        match (from_ty, into_ty) {
+            (Type::Id(from), Type::Id(into)) => {
+                self.build_type_id(*from, *into)?;
             }
+            (from, into) if from != into => bail!("different kinds of types"),
+            _ => {}
+        }
+        Ok(())
+    }
 
-            // FIXME: ideally the functions should be "structurally
-            // equal" but that's not trivial to do in the face of
-            // resources.
+    fn build_function(&mut self, from_func: &Function, into_func: &Function) -> Result<()> {
+        if from_func.name != into_func.name {
+            bail!(
+                "different function names `{}` and `{}`",
+                from_func.name,
+                into_func.name
+            );
+        }
+        match (&from_func.kind, &into_func.kind) {
+            (FunctionKind::Freestanding, FunctionKind::Freestanding) => {}
+
+            (FunctionKind::Method(from), FunctionKind::Method(into))
+            | (FunctionKind::Constructor(from), FunctionKind::Constructor(into))
+            | (FunctionKind::Static(from), FunctionKind::Static(into)) => self
+                .build_type_id(*from, *into)
+                .context("different function kind types")?,
+
+            (FunctionKind::Method(_), _)
+            | (FunctionKind::Constructor(_), _)
+            | (FunctionKind::Static(_), _)
+            | (FunctionKind::Freestanding, _) => {
+                bail!("different function kind types")
+            }
         }
 
+        if from_func.params.len() != into_func.params.len() {
+            bail!("different number of function parameters");
+        }
+        for ((from_name, from_ty), (into_name, into_ty)) in
+            from_func.params.iter().zip(&into_func.params)
+        {
+            if from_name != into_name {
+                bail!("different function parameter names: {from_name} != {into_name}");
+            }
+            self.build_type(from_ty, into_ty)
+                .with_context(|| format!("different function parameter types for `{from_name}`"))?;
+        }
+        if from_func.results.len() != into_func.results.len() {
+            bail!("different number of function results");
+        }
+        for (from_ty, into_ty) in from_func
+            .results
+            .iter_types()
+            .zip(into_func.results.iter_types())
+        {
+            self.build_type(from_ty, into_ty)
+                .context("different function result types")?;
+        }
         Ok(())
     }
 
@@ -2259,7 +2946,7 @@ impl<'a> MergeMap<'a> {
 
     fn match_world_item(&mut self, from: &WorldItem, into: &WorldItem) -> Result<()> {
         match (from, into) {
-            (WorldItem::Interface(from), WorldItem::Interface(into)) => {
+            (WorldItem::Interface { id: from, .. }, WorldItem::Interface { id: into, .. }) => {
                 match (
                     &self.from.interfaces[*from].name,
                     &self.into.interfaces[*into].name,
@@ -2292,7 +2979,7 @@ impl<'a> MergeMap<'a> {
                 assert!(prev.is_none());
             }
 
-            (WorldItem::Interface(_), _)
+            (WorldItem::Interface { .. }, _)
             | (WorldItem::Function(_), _)
             | (WorldItem::Type(_), _) => {
                 bail!("world items do not have the same type")
@@ -2302,65 +2989,85 @@ impl<'a> MergeMap<'a> {
     }
 }
 
+/// Updates stability annotations when merging `from` into `into`.
+///
+/// This is done to keep up-to-date stability information if possible.
+/// Components for example don't carry stability information but WIT does so
+/// this tries to move from "unknown" to stable/unstable if possible.
+fn update_stability(from: &Stability, into: &mut Stability) -> Result<()> {
+    // If `from` is unknown or the two stability annotations are equal then
+    // there's nothing to do here.
+    if from == into || from.is_unknown() {
+        return Ok(());
+    }
+    // Otherwise if `into` is unknown then inherit the stability listed in
+    // `from`.
+    if into.is_unknown() {
+        *into = from.clone();
+        return Ok(());
+    }
+
+    // Failing all that this means that the two attributes are different so
+    // generate an error.
+    bail!("mismatch in stability attributes")
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::{PackageId, Resolve};
+    use crate::Resolve;
+    use anyhow::Result;
 
     #[test]
-    fn select_world() {
+    fn select_world() -> Result<()> {
         let mut resolve = Resolve::default();
-        parse_into(
-            &mut resolve,
+        resolve.push_str(
+            "test.wit",
             r#"
                 package foo:bar@0.1.0;
 
                 world foo {}
             "#,
-        );
-        parse_into(
-            &mut resolve,
+        )?;
+        resolve.push_str(
+            "test.wit",
             r#"
                 package foo:baz@0.1.0;
 
                 world foo {}
             "#,
-        );
-        parse_into(
-            &mut resolve,
+        )?;
+        resolve.push_str(
+            "test.wit",
             r#"
                 package foo:baz@0.2.0;
 
                 world foo {}
             "#,
-        );
+        )?;
 
-        let dummy = parse_into(
-            &mut resolve,
+        let dummy = resolve.push_str(
+            "test.wit",
             r#"
                 package foo:dummy;
 
                 world foo {}
             "#,
-        );
+        )?;
 
-        assert!(resolve.select_world(dummy, None).is_ok());
-        assert!(resolve.select_world(dummy, Some("xx")).is_err());
-        assert!(resolve.select_world(dummy, Some("")).is_err());
-        assert!(resolve.select_world(dummy, Some("foo:bar/foo")).is_ok());
+        assert!(resolve.select_world(&dummy, None).is_ok());
+        assert!(resolve.select_world(&dummy, Some("xx")).is_err());
+        assert!(resolve.select_world(&dummy, Some("")).is_err());
+        assert!(resolve.select_world(&dummy, Some("foo:bar/foo")).is_ok());
         assert!(resolve
-            .select_world(dummy, Some("foo:bar/foo@0.1.0"))
+            .select_world(&dummy, Some("foo:bar/foo@0.1.0"))
             .is_ok());
-        assert!(resolve.select_world(dummy, Some("foo:baz/foo")).is_err());
+        assert!(resolve.select_world(&dummy, Some("foo:baz/foo")).is_err());
         assert!(resolve
-            .select_world(dummy, Some("foo:baz/foo@0.1.0"))
+            .select_world(&dummy, Some("foo:baz/foo@0.1.0"))
             .is_ok());
         assert!(resolve
-            .select_world(dummy, Some("foo:baz/foo@0.2.0"))
+            .select_world(&dummy, Some("foo:baz/foo@0.2.0"))
             .is_ok());
-    }
-
-    fn parse_into(resolve: &mut Resolve, wit: &str) -> PackageId {
-        let pkg = crate::UnresolvedPackage::parse("input.wit".as_ref(), wit).unwrap();
-        resolve.push(pkg).unwrap()
+        Ok(())
     }
 }

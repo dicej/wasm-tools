@@ -16,7 +16,7 @@
 use crate::{
     BinaryReader, BinaryReaderError, FromReader, Result, SectionLimited, Subsection, Subsections,
 };
-use std::ops::Range;
+use core::ops::Range;
 
 /// Represents a name map from the names custom section.
 pub type NameMap<'a> = SectionLimited<'a, Naming<'a>>;
@@ -33,7 +33,10 @@ pub struct Naming<'a> {
 impl<'a> FromReader<'a> for Naming<'a> {
     fn from_reader(reader: &mut BinaryReader<'a>) -> Result<Self> {
         let index = reader.read_var_u32()?;
-        let name = reader.read_string()?;
+        // This seems to match what browsers do where they don't limit the
+        // length of names in the `name` section while they do limit the names
+        // in the import and export section for example.
+        let name = reader.read_unlimited_string()?;
         Ok(Naming { index, name })
     }
 }
@@ -68,7 +71,7 @@ impl<'a> FromReader<'a> for IndirectNaming<'a> {
 
         Ok(IndirectNaming {
             index,
-            names: NameMap::new(names.remaining_buffer(), names.original_position())?,
+            names: NameMap::new(names)?,
         })
     }
 }
@@ -101,6 +104,8 @@ pub enum Name<'a> {
     Element(NameMap<'a>),
     /// The name is for the data segments.
     Data(NameMap<'a>),
+    /// The name is for fields.
+    Field(IndirectNameMap<'a>),
     /// The name is for tags.
     Tag(NameMap<'a>),
     /// An unknown [name subsection](https://webassembly.github.io/spec/core/appendix/custom.html#subsections).
@@ -133,19 +138,20 @@ impl<'a> Subsection<'a> for Name<'a> {
                 }
                 Name::Module {
                     name,
-                    name_range: offset..offset + reader.position,
+                    name_range: offset..reader.original_position(),
                 }
             }
-            1 => Name::Function(NameMap::new(data, offset)?),
-            2 => Name::Local(IndirectNameMap::new(data, offset)?),
-            3 => Name::Label(IndirectNameMap::new(data, offset)?),
-            4 => Name::Type(NameMap::new(data, offset)?),
-            5 => Name::Table(NameMap::new(data, offset)?),
-            6 => Name::Memory(NameMap::new(data, offset)?),
-            7 => Name::Global(NameMap::new(data, offset)?),
-            8 => Name::Element(NameMap::new(data, offset)?),
-            9 => Name::Data(NameMap::new(data, offset)?),
-            11 => Name::Tag(NameMap::new(data, offset)?),
+            1 => Name::Function(NameMap::new(reader)?),
+            2 => Name::Local(IndirectNameMap::new(reader)?),
+            3 => Name::Label(IndirectNameMap::new(reader)?),
+            4 => Name::Type(NameMap::new(reader)?),
+            5 => Name::Table(NameMap::new(reader)?),
+            6 => Name::Memory(NameMap::new(reader)?),
+            7 => Name::Global(NameMap::new(reader)?),
+            8 => Name::Element(NameMap::new(reader)?),
+            9 => Name::Data(NameMap::new(reader)?),
+            10 => Name::Field(IndirectNameMap::new(reader)?),
+            11 => Name::Tag(NameMap::new(reader)?),
             ty => Name::Unknown {
                 ty,
                 data,

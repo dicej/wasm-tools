@@ -298,7 +298,7 @@ pub fn validate_module<'a>(
             }
         } else {
             match world.imports.get(&world_key(&metadata.resolve, name)) {
-                Some(WorldItem::Interface(interface)) => {
+                Some(WorldItem::Interface { id: interface, .. }) => {
                     let required = validate_imported_interface(
                         &metadata.resolve,
                         *interface,
@@ -337,10 +337,10 @@ pub fn validate_module<'a>(
     for (name, interface_name, funcs) in exported_resource_and_async_funcs {
         let world_key = world_key(&metadata.resolve, interface_name);
         match world.exports.get(&world_key) {
-            Some(WorldItem::Interface(i)) => {
+            Some(WorldItem::Interface { id, .. }) => {
                 validate_exported_interface_resource_and_async_imports(
                     &metadata.resolve,
-                    *i,
+                    *id,
                     name,
                     funcs,
                     &types,
@@ -360,10 +360,10 @@ pub fn validate_module<'a>(
             (world.exports.get(&world_key), "exported")
         };
         match item {
-            Some(WorldItem::Interface(i)) => {
+            Some(WorldItem::Interface { id, .. }) => {
                 validate_payload_imports(
                     &metadata.resolve,
-                    *i,
+                    *id,
                     name,
                     imported,
                     funcs,
@@ -729,7 +729,7 @@ pub fn validate_adapter_module<'a>(
 
         if !(is_library && adapters.contains(name)) {
             match resolve.worlds[world].imports.get(&world_key(resolve, name)) {
-                Some(WorldItem::Interface(interface)) => {
+                Some(WorldItem::Interface { id: interface, .. }) => {
                     let required = validate_imported_interface(
                         resolve,
                         *interface,
@@ -786,10 +786,10 @@ pub fn validate_adapter_module<'a>(
     for (name, interface_name, funcs) in exported_resource_and_async_funcs {
         let world_key = world_key(resolve, interface_name);
         match world.exports.get(&world_key) {
-            Some(WorldItem::Interface(i)) => {
+            Some(WorldItem::Interface { id, .. }) => {
                 validate_exported_interface_resource_and_async_imports(
                     resolve,
-                    *i,
+                    *id,
                     name,
                     funcs,
                     &types,
@@ -809,10 +809,10 @@ pub fn validate_adapter_module<'a>(
             (world.exports.get(&world_key), "exported")
         };
         match item {
-            Some(WorldItem::Interface(i)) => {
+            Some(WorldItem::Interface { id, .. }) => {
                 validate_payload_imports(
                     resolve,
-                    *i,
+                    *id,
                     name,
                     imported,
                     funcs,
@@ -897,7 +897,7 @@ fn validate_imports_top_level(
             match resolve.worlds[world].imports.get(&world_key(resolve, name)) {
                 Some(WorldItem::Function(func)) => {
                     let ty = types[types.core_type_at(*ty).unwrap_sub()].unwrap_func();
-                    validate_func(resolve, ty, func, abi)?;
+                    validate_func(resolve, ty, &func, abi)?;
                 }
                 Some(_) => bail!("expected world top-level import `{name}` to be a function"),
                 None => match valid_imported_resource_func(name, *ty, types, is_resource)? {
@@ -1173,7 +1173,9 @@ fn validate_exported_item<'a>(
                 .entry((BARE_FUNC_MODULE_NAME.to_string(), false))
                 .or_default(),
         )?,
-        WorldItem::Interface(interface_id) => {
+        WorldItem::Interface {
+            id: interface_id, ..
+        } => {
             let interface = &resolve.interfaces[*interface_id];
             let mut async_map = IndexMap::new();
             for (_, f) in interface.functions.iter() {
