@@ -737,7 +737,7 @@ enum Type<'a> {
     Result(Result_<'a>),
     Future(Future<'a>),
     Stream(Stream<'a>),
-    Error,
+    Error(Span),
 }
 
 enum Handle<'a> {
@@ -1366,7 +1366,7 @@ impl<'a> Type<'a> {
             }
 
             // error
-            Some((_span, Token::Error)) => Ok(Type::Error),
+            Some((span, Token::Error)) => Ok(Type::Error(span)),
 
             // own<T>
             Some((_span, Token::Own)) => {
@@ -1427,7 +1427,7 @@ impl<'a> Type<'a> {
             Type::Result(r) => r.span,
             Type::Future(f) => f.span,
             Type::Stream(s) => s.span,
-            Type::Error => todo!(),
+            Type::Error(span) => *span,
         }
     }
 }

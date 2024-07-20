@@ -1227,7 +1227,7 @@ impl<'a> Resolver<'a> {
                 self.resolve_optional_type(t.ty.as_ref().map(|bx| &**bx), stability)?,
             ),
             ast::Type::Stream(t) => TypeDefKind::Stream(self.resolve_type(&t.ty, stability)?),
-            ast::Type::Error => TypeDefKind::Error,
+            ast::Type::Error(_) => TypeDefKind::Error,
         })
     }
 
@@ -1490,7 +1490,7 @@ fn collect_deps<'a>(ty: &ast::Type<'a>, deps: &mut Vec<ast::Id<'a>>) {
         | ast::Type::String(_)
         | ast::Type::Flags(_)
         | ast::Type::Enum(_)
-        | ast::Type::Error => {}
+        | ast::Type::Error(_) => {}
         ast::Type::Name(name) => deps.push(name.clone()),
         ast::Type::List(list) => collect_deps(&list.ty, deps),
         ast::Type::Handle(handle) => match handle {
