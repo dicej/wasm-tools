@@ -35,9 +35,9 @@ use {
     },
     wasm_encoder::{
         CodeSection, ConstExpr, DataSection, ElementSection, Elements, EntityType, ExportKind,
-        ExportSection, Function, FunctionSection, GlobalSection, HeapType, ImportSection,
-        Instruction as Ins, MemArg, MemorySection, MemoryType, Module, RawCustomSection, RefType,
-        StartSection, TableSection, TableType, TypeSection, ValType,
+        ExportSection, Function, FunctionSection, GlobalSection, ImportSection, Instruction as Ins,
+        MemArg, MemorySection, MemoryType, Module, RawCustomSection, RefType, StartSection,
+        TableSection, TableType, TypeSection, ValType,
     },
     wasmparser::SymbolFlags,
 };
@@ -57,9 +57,7 @@ enum Address<'a> {
 /// Represents a `dlopen`/`dlsym` lookup table enabling runtime symbol resolution
 ///
 /// The top level of this table is a sorted list of library names and offsets, each pointing to a sorted list of
-/// symbol names and offsets.  See
-/// https://github.com/dicej/wasi-libc/blob/76c7e1e1cfdad577ecd7f61c67ead7a38d62a7c4/libc-top-half/musl/src/misc/dl.c
-/// for how this is used.
+/// symbol names and offsets.  See ../dl/src/lib.rs for how this is used at runtime.
 struct DlOpenables<'a> {
     /// Offset into the main module's table where function references will be stored
     table_base: u32,
@@ -302,6 +300,7 @@ fn make_env_module<'a>(
                             EntityType::Global(wasm_encoder::GlobalType {
                                 val_type: ty.ty.into(),
                                 mutable: ty.mutable,
+                                shared: ty.shared,
                             })
                         }
                     },
@@ -350,6 +349,7 @@ fn make_env_module<'a>(
                 wasm_encoder::GlobalType {
                     val_type: ValType::I32,
                     mutable,
+                    shared: false,
                 },
                 &const_u32(value),
             );
@@ -434,8 +434,8 @@ fn make_env_module<'a>(
         }
         function.instruction(&Ins::I32Const(i32::try_from(table_offset).unwrap()));
         function.instruction(&Ins::CallIndirect {
-            ty: u32::try_from(index).unwrap(),
-            table: 0,
+            type_index: u32::try_from(index).unwrap(),
+            table_index: 0,
         });
         function.instruction(&Ins::End);
         code.function(&function);
@@ -464,12 +464,11 @@ fn make_env_module<'a>(
     {
         let mut tables = TableSection::new();
         tables.table(TableType {
-            element_type: RefType {
-                nullable: true,
-                heap_type: HeapType::Func,
-            },
-            minimum: table_offset,
+            element_type: RefType::FUNCREF,
+            minimum: table_offset.into(),
             maximum: None,
+            table64: false,
+            shared: false,
         });
         exports.export("__indirect_function_table", ExportKind::Table, 0);
         module.section(&tables);
@@ -482,6 +481,7 @@ fn make_env_module<'a>(
             maximum: None,
             memory64: false,
             shared: false,
+            page_size_log2: None,
         });
         exports.export("memory", ExportKind::Memory, 0);
         module.section(&memories);
@@ -550,18 +550,18 @@ fn make_init_module(
             maximum: None,
             memory64: false,
             shared: false,
+            page_size_log2: None,
         },
     );
     imports.import(
         "env",
         "__indirect_function_table",
         TableType {
-            element_type: RefType {
-                nullable: true,
-                heap_type: HeapType::Func,
-            },
+            element_type: RefType::FUNCREF,
             minimum: 0,
             maximum: None,
+            table64: false,
+            shared: false,
         },
     );
 
@@ -577,6 +577,7 @@ fn make_init_module(
                     wasm_encoder::GlobalType {
                         val_type: ValType::I32,
                         mutable,
+                        shared: false,
                     },
                 );
                 get_and_increment(&mut global_count)
@@ -790,6 +791,7 @@ fn find_offset_exporter<'a>(
         ty: Type::Global(GlobalType {
             ty: ValueType::I32,
             mutable: false,
+            shared: false,
         }),
     };
 
@@ -898,6 +900,7 @@ fn resolve_symbols<'a>(
                         ty: Type::Global(GlobalType {
                             ty: ValueType::I32,
                             mutable: false,
+                            shared: false,
                         }),
                     },
                     flags: SymbolFlags::empty(),
@@ -1045,6 +1048,11 @@ fn find_dependencies(
     }
 }
 
+struct EnvFunctionExports<'a> {
+    exports: Vec<(&'a str, &'a FunctionType, usize)>,
+    reexport_cabi_realloc: bool,
+}
+
 /// Analyze the specified metadata and generate a list of functions which should be re-exported as a
 /// `call.indirect`-based function by the main (AKA "env") module, including the offset of the library containing
 /// the original export.
@@ -1052,7 +1060,7 @@ fn env_function_exports<'a>(
     metadata: &'a [Metadata<'a>],
     exporters: &'a IndexMap<&'a ExportKey, (&'a str, &Export)>,
     topo_sorted: &[usize],
-) -> Result<Vec<(&'a str, &'a FunctionType, usize)>> {
+) -> Result<EnvFunctionExports<'a>> {
     let function_exporters = exporters
         .iter()
         .filter_map(|(export, exporter)| {
@@ -1102,7 +1110,12 @@ fn env_function_exports<'a>(
         seen.insert(index);
     }
 
-    Ok(result)
+    let reexport_cabi_realloc = exported.contains("cabi_realloc");
+
+    Ok(EnvFunctionExports {
+        exports: result,
+        reexport_cabi_realloc,
+    })
 }
 
 /// Synthesize a module which contains trapping stub exports for the specified functions.
@@ -1202,6 +1215,9 @@ pub struct Linker {
     /// Whether to generate trapping stubs for any unresolved imports
     stub_missing_functions: bool,
 
+    /// Whether to use a built-in implementation of `dlopen`/`dlsym`.
+    use_built_in_libdl: bool,
+
     /// Size of stack (in bytes) to allocate in the synthesized main module
     ///
     /// If `None`, use `DEFAULT_STACK_SIZE_BYTES`.
@@ -1247,8 +1263,19 @@ impl Linker {
         self
     }
 
+    /// Specify whether to use a built-in implementation of `dlopen`/`dlsym`.
+    pub fn use_built_in_libdl(mut self, use_built_in_libdl: bool) -> Self {
+        self.use_built_in_libdl = use_built_in_libdl;
+        self
+    }
+
     /// Encode the component and return the bytes
     pub fn encode(mut self) -> Result<Vec<u8>> {
+        if self.use_built_in_libdl {
+            self.use_built_in_libdl = false;
+            self = self.library("libdl.so", include_bytes!("../libdl.so"), false)?;
+        }
+
         let adapter_names = self
             .adapters
             .iter()
@@ -1370,12 +1397,21 @@ impl Linker {
 
         let topo_sorted = topo_sort(metadata.len(), &dependencies)?;
 
-        let env_function_exports = env_function_exports(&metadata, &exporters, &topo_sorted)?;
+        let EnvFunctionExports {
+            exports: env_function_exports,
+            reexport_cabi_realloc,
+        } = env_function_exports(&metadata, &exporters, &topo_sorted)?;
 
         let (env_module, dl_openables, table_base) = make_env_module(
             &metadata,
             &env_function_exports,
-            cabi_realloc_exporter,
+            if reexport_cabi_realloc {
+                // If "env" module already reexports "cabi_realloc", we don't need to
+                // reexport it again.
+                None
+            } else {
+                cabi_realloc_exporter
+            },
             self.stack_size.unwrap_or(DEFAULT_STACK_SIZE_BYTES),
         );
 

@@ -12,8 +12,9 @@ pub struct Opts {
     #[clap(short, long)]
     print_offsets: bool,
 
-    /// Indicates that the "skeleton" of a module should be printed where items
-    /// such as function bodies, data segments, and element segments are
+    /// Indicates that the "skeleton" of a module should be printed.
+    ///
+    /// Items such as function bodies, data segments, and element segments are
     /// replaced with "..." instead of printing their actual contents.
     #[clap(long)]
     skeleton: bool,
@@ -34,12 +35,14 @@ impl Opts {
 
     pub fn run(&self) -> Result<()> {
         let wasm = self.io.parse_input_wasm()?;
-        let mut printer = wasmprinter::Printer::new();
-        printer.print_offsets(self.print_offsets);
-        printer.print_skeleton(self.skeleton);
-        printer.name_unnamed(self.name_unnamed);
-        let wat = printer.print(&wasm)?;
-        self.io.output(wasm_tools::Output::Wat(&wat))?;
-        Ok(())
+
+        let mut config = wasmprinter::Config::new();
+        config.print_offsets(self.print_offsets);
+        config.print_skeleton(self.skeleton);
+        config.name_unnamed(self.name_unnamed);
+        self.io.output(wasm_tools::Output::Wat {
+            wasm: &wasm,
+            config,
+        })
     }
 }

@@ -134,14 +134,12 @@
   )
   "type index out of bounds")
 
-(assert_invalid
-  (component $c
-    (type $f (func))
-    (core type $t (module
-      (alias outer 100 0 (type))
-    ))
-  )
-  "outer type aliases in module type declarations are limited to a maximum count of 1")
+(component $c
+  (core type $f (func))
+  (core type $t (module
+    (alias outer $c $f (type))
+  ))
+)
 
 (assert_invalid
   (component $c
@@ -262,17 +260,14 @@
   )
 )
 
-(assert_invalid
-  (component $C
-    (core type $t (func))
-    (component $C2
-      (core type (module
-        (alias outer $C $t (type $a))
-        (import "" "" (func (type $a)))
-      ))
-    )
+(component $C
+  (core type $t (func))
+  (component $C2
+    (core type (module
+      (alias outer $C $t (type $a))
+      (import "" "" (func (type $a)))
+    ))
   )
-  "only the local or enclosing scope can be aliased"
 )
 
 (component
@@ -319,3 +314,52 @@
     (type (tuple))
   )
   "tuple type must have at least one type")
+
+(component $c
+  (core type $f (func))
+  (component $c2
+    (core type $t (module
+      (alias outer $c $f (type))
+    ))
+  )
+)
+
+(assert_invalid
+  (component
+    (type (flags
+      "f1"
+      "f2"
+      "f3"
+      "f4"
+      "f5"
+      "f6"
+      "f7"
+      "f8"
+      "f9"
+      "f10"
+      "f11"
+      "f12"
+      "f13"
+      "f14"
+      "f15"
+      "f16"
+      "f17"
+      "f18"
+      "f19"
+      "f20"
+      "f21"
+      "f22"
+      "f23"
+      "f24"
+      "f25"
+      "f26"
+      "f27"
+      "f28"
+      "f29"
+      "f30"
+      "f31"
+      "f32"
+      "f33"
+    ))
+  )
+  "cannot have more than 32 flags")

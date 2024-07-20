@@ -22,23 +22,19 @@ impl<'a> FromReader<'a> for MemoryType {
     fn from_reader(reader: &mut BinaryReader<'a>) -> Result<Self> {
         let pos = reader.original_position();
         let flags = reader.read_u8()?;
-        if (flags & !0b111) != 0 {
+
+        if (flags & !0b1111) != 0 {
             bail!(pos, "invalid memory limits flags");
         }
 
-        let memory64 = flags & 0b100 != 0;
-        let shared = flags & 0b010 != 0;
-        let has_max = flags & 0b001 != 0;
+        let memory64 = flags & 0b0100 != 0;
+        let shared = flags & 0b0010 != 0;
+        let has_max = flags & 0b0001 != 0;
+        let has_page_size = flags & 0b1000 != 0;
+
         Ok(MemoryType {
             memory64,
             shared,
-            // FIXME(WebAssembly/memory64#21) as currently specified if the
-            // `shared` flag is set we should be reading a 32-bit limits field
-            // here. That seems a bit odd to me at the time of this writing so
-            // I've taken the liberty of reading a 64-bit limits field in those
-            // situations. I suspect that this is a typo in the spec, but if not
-            // we'll need to update this to read a 32-bit limits field when the
-            // shared flag is set.
             initial: if memory64 {
                 reader.read_var_u64()?
             } else {
@@ -50,6 +46,11 @@ impl<'a> FromReader<'a> for MemoryType {
                 Some(reader.read_var_u64()?)
             } else {
                 Some(reader.read_var_u32()?.into())
+            },
+            page_size_log2: if has_page_size {
+                Some(reader.read_var_u32()?)
+            } else {
+                None
             },
         })
     }

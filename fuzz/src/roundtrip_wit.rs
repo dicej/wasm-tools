@@ -1,5 +1,6 @@
 use arbitrary::{Result, Unstructured};
 use std::path::Path;
+use wasmparser::WasmFeatures;
 use wit_component::*;
 use wit_parser::{Resolve, SourceMap};
 
@@ -10,17 +11,23 @@ pub fn run(u: &mut Unstructured<'_>) -> Result<()> {
     })?;
     write_file("doc1.wasm", &wasm);
     let (resolve, _pkg) = match wit_component::decode(&wasm).unwrap() {
-        DecodedWasm::WitPackage(resolve, pkg) => (resolve, pkg),
+        DecodedWasm::WitPackages(resolve, pkg) => (resolve, pkg),
         DecodedWasm::Component(..) => unreachable!(),
     };
 
     roundtrip_through_printing("doc1", &resolve, &wasm);
 
-    let (resolve2, pkg2) = match wit_component::decode(&wasm).unwrap() {
-        DecodedWasm::WitPackage(resolve, pkg) => (resolve, pkg),
+    let (resolve2, pkgs2) = match wit_component::decode(&wasm).unwrap() {
+        DecodedWasm::WitPackages(resolve, pkgs) => (resolve, pkgs),
         DecodedWasm::Component(..) => unreachable!(),
     };
 
+    // wit_smith returns WIT source with only a single package.
+    if pkgs2.len() != 1 {
+        panic!("rountrip WIT test smithed file with multiple packages")
+    }
+
+    let pkg2 = pkgs2[0];
     let wasm2 =
         wit_component::encode(Some(true), &resolve2, pkg2).expect("failed to encode WIT document");
     write_file("doc2.wasm", &wasm2);
@@ -49,10 +56,9 @@ pub fn run(u: &mut Unstructured<'_>) -> Result<()> {
             .encode()
             .unwrap();
         write_file("dummy.component.wasm", &wasm);
-        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures {
-            component_model: true,
-            ..Default::default()
-        })
+        wasmparser::Validator::new_with_features(
+            WasmFeatures::default() | WasmFeatures::COMPONENT_MODEL,
+        )
         .validate_all(&wasm)
         .unwrap();
 
@@ -80,12 +86,12 @@ fn roundtrip_through_printing(file: &str, resolve: &Resolve, wasm: &[u8]) {
     for (id, pkg) in resolve.packages.iter() {
         let mut map = SourceMap::new();
         let pkg_name = &pkg.name;
-        let doc = WitPrinter::default().print(resolve, id).unwrap();
+        let doc = WitPrinter::default().print(resolve, &[id], false).unwrap();
         write_file(&format!("{file}-{pkg_name}.wit"), &doc);
         map.push(format!("{pkg_name}.wit").as_ref(), doc);
         let unresolved = map.parse().unwrap();
-        let id = new_resolve.push(unresolved).unwrap();
-        last = Some(id);
+        let id = new_resolve.push_group(unresolved).unwrap();
+        last = Some(id.last().unwrap().to_owned());
     }
 
     // Finally encode the `new_resolve` which should be the exact same as

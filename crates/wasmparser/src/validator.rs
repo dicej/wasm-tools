@@ -13,13 +13,16 @@
  * limitations under the License.
  */
 
+use crate::prelude::*;
 use crate::{
-    limits::*, BinaryReaderError, Encoding, FromReader, FunctionBody, HeapType, Parser, Payload,
-    RefType, Result, SectionLimited, ValType, WASM_COMPONENT_VERSION, WASM_MODULE_VERSION,
+    limits::*, AbstractHeapType, BinaryReaderError, Encoding, FromReader, FunctionBody, HeapType,
+    Parser, Payload, RefType, Result, SectionLimited, ValType, WasmFeatures,
+    WASM_COMPONENT_VERSION, WASM_MODULE_VERSION,
 };
-use std::mem;
-use std::ops::Range;
-use std::sync::Arc;
+use ::core::mem;
+use ::core::ops::Range;
+use ::core::sync::atomic::{AtomicUsize, Ordering};
+use alloc::sync::Arc;
 
 /// Test whether the given buffer contains a valid WebAssembly module or component,
 /// analogous to [`WebAssembly.validate`][js] in the JS API.
@@ -85,6 +88,23 @@ fn combine_type_sizes(a: u32, b: u32, offset: usize) -> Result<u32> {
     }
 }
 
+/// A unique identifier for a particular `Validator`.
+///
+/// Allows you to save the `ValidatorId` of the [`Validator`][crate::Validator]
+/// you get identifiers out of (e.g. [`CoreTypeId`][crate::types::CoreTypeId])
+/// and then later assert that you are pairing those identifiers with the same
+/// `Validator` instance when accessing the identifier's associated data.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, PartialOrd, Ord)]
+pub struct ValidatorId(usize);
+
+impl Default for ValidatorId {
+    #[inline]
+    fn default() -> Self {
+        static ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
+        ValidatorId(ID_COUNTER.fetch_add(1, Ordering::AcqRel))
+    }
+}
+
 /// Validator for a WebAssembly binary module or component.
 ///
 /// This structure encapsulates state necessary to validate a WebAssembly
@@ -112,6 +132,8 @@ fn combine_type_sizes(a: u32, b: u32, offset: usize) -> Result<u32> {
 /// [core]: https://webassembly.github.io/spec/core/valid/index.html
 #[derive(Default)]
 pub struct Validator {
+    id: ValidatorId,
+
     /// The current state of the validator.
     state: State,
 
@@ -197,90 +219,7 @@ impl Default for State {
     }
 }
 
-/// Flags for features that are enabled for validation.
-#[derive(Hash, Debug, Copy, Clone)]
-pub struct WasmFeatures {
-    /// The WebAssembly `mutable-global` proposal (enabled by default)
-    pub mutable_global: bool,
-    /// The WebAssembly `nontrapping-float-to-int-conversions` proposal (enabled by default)
-    pub saturating_float_to_int: bool,
-    /// The WebAssembly `sign-extension-ops` proposal (enabled by default)
-    pub sign_extension: bool,
-    /// The WebAssembly reference types proposal (enabled by default)
-    pub reference_types: bool,
-    /// The WebAssembly multi-value proposal (enabled by default)
-    pub multi_value: bool,
-    /// The WebAssembly bulk memory operations proposal (enabled by default)
-    pub bulk_memory: bool,
-    /// The WebAssembly SIMD proposal (enabled by default)
-    pub simd: bool,
-    /// The WebAssembly Relaxed SIMD proposal (enabled by default)
-    pub relaxed_simd: bool,
-    /// The WebAssembly threads proposal (enabled by default)
-    pub threads: bool,
-    /// The WebAssembly tail-call proposal (enabled by default)
-    pub tail_call: bool,
-    /// Whether or not floating-point instructions are enabled.
-    ///
-    /// This is enabled by default can be used to disallow floating-point
-    /// operators and types.
-    ///
-    /// This does not correspond to a WebAssembly proposal but is instead
-    /// intended for embeddings which have stricter-than-usual requirements
-    /// about execution. Floats in WebAssembly can have different NaN patterns
-    /// across hosts which can lead to host-dependent execution which some
-    /// runtimes may not desire.
-    pub floats: bool,
-    /// The WebAssembly multi memory proposal (enabled by default)
-    pub multi_memory: bool,
-    /// The WebAssembly exception handling proposal
-    pub exceptions: bool,
-    /// The WebAssembly memory64 proposal
-    pub memory64: bool,
-    /// The WebAssembly extended_const proposal
-    pub extended_const: bool,
-    /// The WebAssembly component model proposal.
-    pub component_model: bool,
-    /// The WebAssembly typed function references proposal
-    pub function_references: bool,
-    /// The WebAssembly memory control proposal
-    pub memory_control: bool,
-    /// The WebAssembly gc proposal
-    pub gc: bool,
-    /// Support for the `value` type in the component model proposal.
-    pub component_model_values: bool,
-    /// Support for the nested namespaces and projects in component model names.
-    pub component_model_nested_names: bool,
-}
-
 impl WasmFeatures {
-    /// Returns [`WasmFeatures`] with all features enabled.
-    pub fn all() -> Self {
-        WasmFeatures {
-            mutable_global: true,
-            saturating_float_to_int: true,
-            sign_extension: true,
-            reference_types: true,
-            multi_value: true,
-            bulk_memory: true,
-            simd: true,
-            relaxed_simd: true,
-            threads: true,
-            tail_call: true,
-            floats: true,
-            multi_memory: true,
-            exceptions: true,
-            memory64: true,
-            extended_const: true,
-            component_model: true,
-            function_references: true,
-            memory_control: true,
-            gc: true,
-            component_model_values: true,
-            component_model_nested_names: true,
-        }
-    }
-
     /// NOTE: This only checks that the value type corresponds to the feature set!!
     ///
     /// To check that reference types are valid, we need access to the module
@@ -289,7 +228,7 @@ impl WasmFeatures {
         match ty {
             ValType::I32 | ValType::I64 => Ok(()),
             ValType::F32 | ValType::F64 => {
-                if self.floats {
+                if self.floats() {
                     Ok(())
                 } else {
                     Err("floating-point support is disabled")
@@ -297,7 +236,7 @@ impl WasmFeatures {
             }
             ValType::Ref(r) => self.check_ref_type(r),
             ValType::V128 => {
-                if self.simd {
+                if self.simd() {
                     Ok(())
                 } else {
                     Err("SIMD support is not enabled")
@@ -307,91 +246,59 @@ impl WasmFeatures {
     }
 
     pub(crate) fn check_ref_type(&self, r: RefType) -> Result<(), &'static str> {
-        if !self.reference_types {
+        if !self.reference_types() {
             return Err("reference types support is not enabled");
         }
-        match (r.heap_type(), r.is_nullable()) {
-            // funcref/externref only require `reference-types`.
-            (HeapType::Func, true) | (HeapType::Extern, true) => Ok(()),
-
-            // Non-nullable func/extern references requires the
-            // `function-references` proposal.
-            (HeapType::Func | HeapType::Extern, false) => {
-                if self.function_references {
-                    Ok(())
-                } else {
-                    Err("function references required for non-nullable types")
-                }
-            }
-
-            // Indexed types require either the function-references or gc
-            // proposal as gc implies function references here.
-            (HeapType::Concrete(_), _) => {
-                if self.function_references || self.gc {
+        match r.heap_type() {
+            HeapType::Concrete(_) => {
+                // Indexed types require either the function-references or gc
+                // proposal as gc implies function references here.
+                if self.function_references() || self.gc() {
                     Ok(())
                 } else {
                     Err("function references required for index reference types")
                 }
             }
+            HeapType::Abstract { shared, ty } => {
+                use AbstractHeapType::*;
+                if shared && !self.shared_everything_threads() {
+                    return Err(
+                        "shared reference types require the shared-everything-threads proposal",
+                    );
+                }
+                match (ty, r.is_nullable()) {
+                    // funcref/externref only require `reference-types`.
+                    (Func, true) | (Extern, true) => Ok(()),
 
-            // These types were added in the gc proposal.
-            (
-                HeapType::Any
-                | HeapType::None
-                | HeapType::Eq
-                | HeapType::Struct
-                | HeapType::Array
-                | HeapType::I31
-                | HeapType::NoExtern
-                | HeapType::NoFunc,
-                _,
-            ) => {
-                if self.gc {
-                    Ok(())
-                } else {
-                    Err("heap types not supported without the gc feature")
+                    // Non-nullable func/extern references requires the
+                    // `function-references` proposal.
+                    (Func | Extern, false) => {
+                        if self.function_references() {
+                            Ok(())
+                        } else {
+                            Err("function references required for non-nullable types")
+                        }
+                    }
+
+                    // These types were added in the gc proposal.
+                    (Any | None | Eq | Struct | Array | I31 | NoExtern | NoFunc, _) => {
+                        if self.gc() {
+                            Ok(())
+                        } else {
+                            Err("heap types not supported without the gc feature")
+                        }
+                    }
+
+                    // These types were added in the exception-handling proposal.
+                    (Exn | NoExn, _) => {
+                        if self.exceptions() {
+                            Ok(())
+                        } else {
+                            Err("exception refs not supported without the exception handling feature")
+                        }
+                    }
                 }
             }
-
-            // These types were added in the exception-handling proposal.
-            (HeapType::Exn, _) => {
-                if self.exceptions {
-                    Ok(())
-                } else {
-                    Err("exception refs not supported without the exception handling feature")
-                }
-            }
-        }
-    }
-}
-
-impl Default for WasmFeatures {
-    fn default() -> WasmFeatures {
-        WasmFeatures {
-            // Off-by-default features.
-            exceptions: false,
-            memory64: false,
-            extended_const: false,
-            function_references: false,
-            memory_control: false,
-            gc: false,
-            component_model_values: false,
-            component_model_nested_names: false,
-
-            // On-by-default features (phase 4 or greater).
-            mutable_global: true,
-            saturating_float_to_int: true,
-            sign_extension: true,
-            bulk_memory: true,
-            multi_value: true,
-            reference_types: true,
-            tail_call: true,
-            simd: true,
-            floats: true,
-            relaxed_simd: true,
-            threads: true,
-            multi_memory: true,
-            component_model: true,
         }
     }
 }
@@ -442,6 +349,100 @@ impl Validator {
         &self.features
     }
 
+    /// Reset this validator's state such that it is ready to validate a new
+    /// Wasm module or component.
+    ///
+    /// This does *not* clear or reset the internal state keeping track of
+    /// validated (and deduplicated and canonicalized) types, allowing you to
+    /// use the same type identifiers (such as
+    /// [`CoreTypeId`][crate::types::CoreTypeId]) for the same types that are
+    /// defined multiple times across different modules and components.
+    ///
+    /// ```
+    /// fn foo() -> anyhow::Result<()> {
+    /// use wasmparser::Validator;
+    ///
+    /// let mut validator = Validator::default();
+    ///
+    /// // Two wasm modules, both of which define the same type, but at
+    /// // different indices in their respective types index spaces.
+    /// let wasm1 = wat::parse_str("
+    ///     (module
+    ///         (type $same_type (func (param i32) (result f64)))
+    ///     )
+    /// ")?;
+    /// let wasm2 = wat::parse_str("
+    ///     (module
+    ///         (type $different_type (func))
+    ///         (type $same_type (func (param i32) (result f64)))
+    ///     )
+    /// ")?;
+    ///
+    /// // Validate the first Wasm module and get the ID of its type.
+    /// let types = validator.validate_all(&wasm1)?;
+    /// let id1 = types.core_type_at(0);
+    ///
+    /// // Reset the validator so we can parse the second wasm module inside
+    /// // this validator's same context.
+    /// validator.reset();
+    ///
+    /// // Validate the second Wasm module and get the ID of its second type,
+    /// // which is the same type as the first Wasm module's only type.
+    /// let types = validator.validate_all(&wasm2)?;
+    /// let id2 = types.core_type_at(1);
+    ///
+    /// // Because both modules were processed in the same `Validator`, they
+    /// // share the same types context and therefore the same type defined
+    /// // multiple times across different modules will be deduplicated and
+    /// // assigned the same identifier!
+    /// assert_eq!(id1, id2);
+    /// assert_eq!(types[id1.unwrap_sub()], types[id2.unwrap_sub()]);
+    /// # Ok(())
+    /// # }
+    /// # foo().unwrap()
+    /// ```
+    pub fn reset(&mut self) {
+        let Validator {
+            // Not changing the identifier; users should be able to observe that
+            // they are using the same validation context, even after resetting.
+            id: _,
+
+            // Don't mess with `types`, we specifically want to reuse canonicalizations.
+            types: _,
+
+            // Also leave features as they are. While this is perhaps not
+            // strictly necessary, it helps us avoid weird bugs where we have
+            // different views of what is or is not a valid type at different
+            // times, despite using the same `TypeList` and hash consing
+            // context, and therefore there could be moments in time where we
+            // have "invalid" types inside our current types list.
+            features: _,
+
+            state,
+            module,
+            components,
+        } = self;
+
+        assert!(
+            matches!(state, State::End),
+            "cannot reset a validator that did not successfully complete validation"
+        );
+        assert!(module.is_none());
+        assert!(components.is_empty());
+
+        *state = State::default();
+    }
+
+    /// Get this validator's unique identifier.
+    ///
+    /// Allows you to assert that you are always working with the same
+    /// `Validator` instance, when you can't otherwise statically ensure that
+    /// property by e.g. storing a reference to the validator inside your
+    /// structure.
+    pub fn id(&self) -> ValidatorId {
+        self.id
+    }
+
     /// Validates an entire in-memory module or component with this validator.
     ///
     /// This function will internally create a [`Parser`] to parse the `bytes`
@@ -453,7 +454,9 @@ impl Validator {
     pub fn validate_all(&mut self, bytes: &[u8]) -> Result<Types> {
         let mut functions_to_validate = Vec::new();
         let mut last_types = None;
-        for payload in Parser::new(0).parse_all(bytes) {
+        let mut parser = Parser::new(0);
+        parser.set_features(self.features);
+        for payload in parser.parse_all(bytes) {
             match self.payload(&payload?)? {
                 ValidPayload::Func(a, b) => {
                     functions_to_validate.push((a, b));
@@ -488,7 +491,7 @@ impl Validator {
     pub fn types(&self, mut level: usize) -> Option<TypesRef> {
         if let Some(module) = &self.module {
             if level == 0 {
-                return Some(TypesRef::from_module(&self.types, &module.module));
+                return Some(TypesRef::from_module(self.id, &self.types, &module.module));
             } else {
                 level -= 1;
             }
@@ -497,7 +500,7 @@ impl Validator {
         self.components
             .iter()
             .nth_back(level)
-            .map(|component| TypesRef::from_component(&self.types, component))
+            .map(|component| TypesRef::from_component(self.id, &self.types, component))
     }
 
     /// Convenience function to validate a single [`Payload`].
@@ -546,13 +549,21 @@ impl Validator {
             DataSection(s) => self.data_section(s)?,
 
             // Component sections
-            ModuleSection { parser, range, .. } => {
+            ModuleSection {
+                parser,
+                unchecked_range: range,
+                ..
+            } => {
                 self.module_section(range)?;
                 return Ok(ValidPayload::Parser(parser.clone()));
             }
             InstanceSection(s) => self.instance_section(s)?,
             CoreTypeSection(s) => self.core_type_section(s)?,
-            ComponentSection { parser, range, .. } => {
+            ComponentSection {
+                parser,
+                unchecked_range: range,
+                ..
+            } => {
                 self.component_section(range)?;
                 return Ok(ValidPayload::Parser(parser.clone()));
             }
@@ -608,7 +619,7 @@ impl Validator {
                 }
             }
             Encoding::Component => {
-                if !self.features.component_model {
+                if !self.features.component_model() {
                     bail!(
                         range.start,
                         "unknown binary version and encoding combination: {num:#x} and 0x1, \
@@ -666,7 +677,17 @@ impl Validator {
             Order::Import,
             section,
             "import",
-            |_, _, _, _, _| Ok(()), // add_import will check limits
+            |state, _, _, count, offset| {
+                check_max(
+                    state.module.imports.len(),
+                    count,
+                    MAX_WASM_IMPORTS,
+                    "imports",
+                    offset,
+                )?;
+                state.module.assert_mut().imports.reserve(count as usize);
+                Ok(())
+            },
             |state, features, types, import, offset| {
                 state
                     .module
@@ -754,7 +775,7 @@ impl Validator {
     ///
     /// This method should only be called when parsing a module.
     pub fn tag_section(&mut self, section: &crate::TagSectionReader<'_>) -> Result<()> {
-        if !self.features.exceptions {
+        if !self.features.exceptions() {
             return Err(BinaryReaderError::new(
                 "exceptions proposal not enabled",
                 section.range().start,
@@ -968,12 +989,12 @@ impl Validator {
         let state = self.module.as_mut().unwrap();
 
         let (index, ty) = state.next_code_index_and_type(offset)?;
-        Ok(FuncToValidate::new(
+        Ok(FuncToValidate {
             index,
             ty,
-            ValidatorResources(state.module.arc().clone()),
-            &self.features,
-        ))
+            resources: ValidatorResources(state.module.arc().clone()),
+            features: self.features,
+        })
     }
 
     /// Validates [`Payload::DataSection`](crate::Payload).
@@ -1341,7 +1362,7 @@ impl Validator {
     ///
     /// Returns the types known to the validator for the module or component.
     pub fn end(&mut self, offset: usize) -> Result<Types> {
-        match std::mem::replace(&mut self.state, State::End) {
+        match mem::replace(&mut self.state, State::End) {
             State::Unparsed(_) => Err(BinaryReaderError::new(
                 "cannot call `end` before a header has been parsed",
                 offset,
@@ -1362,6 +1383,7 @@ impl Validator {
                 }
 
                 Ok(Types::from_module(
+                    self.id,
                     self.types.commit(),
                     state.module.arc().clone(),
                 ))
@@ -1386,7 +1408,11 @@ impl Validator {
                     self.state = State::Component;
                 }
 
-                Ok(Types::from_component(self.types.commit(), component))
+                Ok(Types::from_component(
+                    self.id,
+                    self.types.commit(),
+                    component,
+                ))
             }
         }
     }
@@ -1459,7 +1485,7 @@ impl Validator {
     {
         let offset = section.range().start;
 
-        if !self.features.component_model {
+        if !self.features.component_model() {
             return Err(BinaryReaderError::new(
                 "component model feature is not enabled",
                 offset,
@@ -1510,10 +1536,8 @@ mod tests {
         "#,
         )?;
 
-        let mut validator = Validator::new_with_features(WasmFeatures {
-            exceptions: true,
-            ..Default::default()
-        });
+        let mut validator =
+            Validator::new_with_features(WasmFeatures::default() | WasmFeatures::EXCEPTIONS);
 
         let types = validator.validate_all(&bytes)?;
 
@@ -1551,7 +1575,8 @@ mod tests {
                 memory64: false,
                 shared: false,
                 initial: 1,
-                maximum: Some(5)
+                maximum: Some(5),
+                page_size_log2: None,
             }
         );
 
@@ -1561,6 +1586,8 @@ mod tests {
                 initial: 10,
                 maximum: None,
                 element_type: RefType::FUNCREF,
+                table64: false,
+                shared: false,
             }
         );
 
@@ -1568,7 +1595,8 @@ mod tests {
             types.global_at(0),
             GlobalType {
                 content_type: ValType::I32,
-                mutable: true
+                mutable: true,
+                shared: false
             }
         );
 
@@ -1599,10 +1627,8 @@ mod tests {
         "#,
         )?;
 
-        let mut validator = Validator::new_with_features(WasmFeatures {
-            component_model: true,
-            ..Default::default()
-        });
+        let mut validator =
+            Validator::new_with_features(WasmFeatures::default() | WasmFeatures::COMPONENT_MODEL);
 
         let types = validator.validate_all(&bytes)?;
 
@@ -1634,10 +1660,8 @@ mod tests {
         "#,
         )?;
 
-        let mut validator = Validator::new_with_features(WasmFeatures {
-            component_model: true,
-            ..Default::default()
-        });
+        let mut validator =
+            Validator::new_with_features(WasmFeatures::default() | WasmFeatures::COMPONENT_MODEL);
 
         let types = validator.validate_all(&bytes)?;
 

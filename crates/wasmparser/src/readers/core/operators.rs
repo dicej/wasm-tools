@@ -14,6 +14,7 @@
  */
 
 use crate::limits::MAX_WASM_CATCHES;
+use crate::prelude::*;
 use crate::{BinaryReader, BinaryReaderError, FromReader, Result, ValType};
 
 /// Represents a block type.
@@ -30,7 +31,7 @@ pub enum BlockType {
 }
 
 /// Represents a memory immediate in a WebAssembly memory instruction.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub struct MemArg {
     /// Alignment, stored as `n` where the actual alignment is `2^n`
     pub align: u8,
@@ -63,6 +64,16 @@ pub struct BrTable<'a> {
     pub(crate) default: u32,
 }
 
+impl PartialEq<Self> for BrTable<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cnt == other.cnt
+            && self.default == other.default
+            && self.reader.remaining_buffer() == other.reader.remaining_buffer()
+    }
+}
+
+impl Eq for BrTable<'_> {}
+
 /// An IEEE binary32 immediate floating point value, represented as a u32
 /// containing the bit pattern.
 ///
@@ -77,6 +88,20 @@ impl Ieee32 {
     }
 }
 
+impl From<f32> for Ieee32 {
+    fn from(value: f32) -> Self {
+        Ieee32 {
+            0: u32::from_le_bytes(value.to_le_bytes()),
+        }
+    }
+}
+
+impl From<Ieee32> for f32 {
+    fn from(bits: Ieee32) -> f32 {
+        f32::from_bits(bits.bits())
+    }
+}
+
 /// An IEEE binary64 immediate floating point value, represented as a u64
 /// containing the bit pattern.
 ///
@@ -88,6 +113,20 @@ impl Ieee64 {
     /// Gets the underlying bits of the 64-bit float.
     pub fn bits(self) -> u64 {
         self.0
+    }
+}
+
+impl From<f64> for Ieee64 {
+    fn from(value: f64) -> Self {
+        Ieee64 {
+            0: u64::from_le_bytes(value.to_le_bytes()),
+        }
+    }
+}
+
+impl From<Ieee64> for f64 {
+    fn from(bits: Ieee64) -> f64 {
+        f64::from_bits(bits.bits())
     }
 }
 
@@ -107,12 +146,42 @@ impl V128 {
     }
 }
 
+impl From<V128> for i128 {
+    fn from(bits: V128) -> i128 {
+        bits.i128()
+    }
+}
+
+impl From<V128> for u128 {
+    fn from(bits: V128) -> u128 {
+        u128::from_le_bytes(bits.0)
+    }
+}
+
+/// Represents the memory ordering for atomic instructions.
+///
+/// For an in-depth explanation of memory orderings, see the C++ documentation
+/// for [`memory_order`] or the Rust documentation for [`atomic::Ordering`].
+///
+/// [`memory_order`]: https://en.cppreference.com/w/cpp/atomic/memory_order
+/// [`atomic::Ordering`]: https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub enum Ordering {
+    /// For a load, it acquires; this orders all operations before the last
+    /// "releasing" store. For a store, it releases; this orders all operations
+    /// before it at the next "acquiring" load.
+    AcqRel,
+    /// Like `AcqRel` but all threads see all sequentially consistent operations
+    /// in the same order.
+    SeqCst,
+}
+
 macro_rules! define_operator {
     ($(@$proposal:ident $op:ident $({ $($payload:tt)* })? => $visit:ident)*) => {
         /// Instructions as defined [here].
         ///
         /// [here]: https://webassembly.github.io/spec/core/binary/instructions.html
-        #[derive(Debug, Clone)]
+        #[derive(Debug, Clone, Eq, PartialEq)]
         #[allow(missing_docs)]
         pub enum Operator<'a> {
             $(
@@ -126,7 +195,7 @@ for_each_operator!(define_operator);
 /// A reader for a core WebAssembly function's operators.
 #[derive(Clone)]
 pub struct OperatorsReader<'a> {
-    pub(crate) reader: BinaryReader<'a>,
+    reader: BinaryReader<'a>,
 }
 
 impl<'a> OperatorsReader<'a> {
@@ -142,15 +211,6 @@ impl<'a> OperatorsReader<'a> {
     /// Gets the original position of the reader.
     pub fn original_position(&self) -> usize {
         self.reader.original_position()
-    }
-
-    /// Whether or not to allow 64-bit memory arguments in the
-    /// the operators being read.
-    ///
-    /// This is intended to be `true` when support for the memory64
-    /// WebAssembly proposal is also enabled.
-    pub fn allow_memarg64(&mut self, allow: bool) {
-        self.reader.allow_memarg64(allow);
     }
 
     /// Ensures the reader is at the end.
@@ -199,6 +259,12 @@ impl<'a> OperatorsReader<'a> {
     pub fn get_binary_reader(&self) -> BinaryReader<'a> {
         self.reader.clone()
     }
+
+    /// Returns whether there is an `end` opcode followed by eof remaining in
+    /// this reader.
+    pub fn is_end_then_eof(&self) -> bool {
+        self.reader.is_end_then_eof()
+    }
 }
 
 impl<'a> IntoIterator for OperatorsReader<'a> {
@@ -209,10 +275,11 @@ impl<'a> IntoIterator for OperatorsReader<'a> {
     ///
     /// # Examples
     /// ```
-    /// use wasmparser::{Operator, CodeSectionReader, Result};
+    /// # use wasmparser::{Operator, CodeSectionReader, Result, BinaryReader, WasmFeatures};
     /// # let data: &[u8] = &[
     /// #     0x01, 0x03, 0x00, 0x01, 0x0b];
-    /// let code_reader = CodeSectionReader::new(data, 0).unwrap();
+    /// let reader = BinaryReader::new(data, 0, WasmFeatures::all());
+    /// let code_reader = CodeSectionReader::new(reader).unwrap();
     /// for body in code_reader {
     ///     let body = body.expect("function body");
     ///     let mut op_reader = body.get_operators_reader().expect("op reader");
@@ -264,10 +331,11 @@ impl<'a> Iterator for OperatorsIteratorWithOffsets<'a> {
     ///
     /// # Examples
     /// ```
-    /// use wasmparser::{Operator, CodeSectionReader, Result};
+    /// use wasmparser::{Operator, CodeSectionReader, Result, BinaryReader, WasmFeatures};
     /// # let data: &[u8] = &[
     /// #     0x01, 0x03, 0x00, /* offset = 23 */ 0x01, 0x0b];
-    /// let code_reader = CodeSectionReader::new(data, 20).unwrap();
+    /// let reader = BinaryReader::new(data, 20, WasmFeatures::all());
+    /// let code_reader = CodeSectionReader::new(reader).unwrap();
     /// for body in code_reader {
     ///     let body = body.expect("function body");
     ///     let mut op_reader = body.get_operators_reader().expect("op reader");
@@ -355,7 +423,7 @@ impl<'a, V: VisitOperator<'a> + ?Sized> VisitOperator<'a> for Box<V> {
 }
 
 /// A `try_table` entries representation.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TryTable {
     /// The block type describing the try block itself.
     pub ty: BlockType,
@@ -364,7 +432,7 @@ pub struct TryTable {
 }
 
 /// Catch clauses that can be specified in [`TryTable`].
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[allow(missing_docs)]
 pub enum Catch {
     /// Equivalent of `catch`

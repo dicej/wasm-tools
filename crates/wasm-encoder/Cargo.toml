@@ -11,6 +11,10 @@ documentation = "https://docs.rs/wasm-encoder"
 description = """
 A low-level WebAssembly encoder.
 """
+rust-version.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
 
 [lints]
 workspace = true

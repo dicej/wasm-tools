@@ -536,7 +536,7 @@ impl<'a> EncodingState<'a> {
         for (name, item) in resolve.worlds[world].imports.iter() {
             let func = match item {
                 WorldItem::Function(f) => f,
-                WorldItem::Interface(_) | WorldItem::Type(_) => continue,
+                WorldItem::Interface { .. } | WorldItem::Type(_) => continue,
             };
             let name = resolve.name_world_key(name);
             if !info.lowerings.contains_key(&name) {
@@ -829,8 +829,8 @@ impl<'a> EncodingState<'a> {
                     self.component
                         .export(&export_string, ComponentExportKind::Func, idx, None);
                 }
-                WorldItem::Interface(export) => {
-                    self.encode_interface_export(&export_string, module, *export)?;
+                WorldItem::Interface { id, .. } => {
+                    self.encode_interface_export(&export_string, module, *id)?;
                 }
                 WorldItem::Type(_) => unreachable!(),
             }
@@ -1429,8 +1429,10 @@ impl<'a> EncodingState<'a> {
 
         let table_type = TableType {
             element_type: RefType::FUNCREF,
-            minimum: signatures.len() as u32,
-            maximum: Some(signatures.len() as u32),
+            minimum: signatures.len() as u64,
+            maximum: Some(signatures.len() as u64),
+            table64: false,
+            shared: false,
         };
 
         tables.table(table_type);
@@ -1496,8 +1498,8 @@ impl<'a> EncodingState<'a> {
         }
         func.instruction(&Instruction::I32Const(func_index as i32));
         func.instruction(&Instruction::CallIndirect {
-            ty: type_index,
-            table: 0,
+            type_index,
+            table_index: 0,
         });
         func.instruction(&Instruction::End);
         code.function(&func);
@@ -1645,6 +1647,7 @@ impl<'a> EncodingState<'a> {
                                         _ => unreachable!(),
                                     },
                                     docs: Default::default(),
+                                    stability: wit_parser::Stability::default(),
                                 },
                                 AbiVariant::GuestImportAsync,
                             ) & !RequiredOptions::ASYNC)
@@ -2616,7 +2619,7 @@ impl ComponentEncoder {
             .with_context(|| {
                 format!("failed to merge WIT packages of adapter `{name}` into main packages")
             })?
-            .worlds[metadata.world.index()];
+            .map_world(metadata.world, None)?;
         self.metadata
             .resolve
             .merge_worlds(world, self.metadata.world)
@@ -2696,7 +2699,7 @@ impl ComponentEncoder {
 
         self.metadata.resolve.add_future_and_stream_results();
 
-        let world = ComponentWorld::new(self)?;
+        let world = ComponentWorld::new(self).context("failed to decode world from module")?;
         let mut state = EncodingState {
             component: ComponentBuilder::default(),
             module_index: None,
@@ -2734,10 +2737,9 @@ impl ComponentEncoder {
         std::fs::write("/tmp/foo.wasm", &bytes).unwrap();
 
         if self.validate {
-            let mut validator = Validator::new_with_features(WasmFeatures {
-                component_model: true,
-                ..Default::default()
-            });
+            let mut validator = Validator::new_with_features(
+                WasmFeatures::default() | WasmFeatures::COMPONENT_MODEL,
+            );
 
             validator
                 .validate_all(&bytes)
@@ -2750,20 +2752,16 @@ impl ComponentEncoder {
 
 #[cfg(all(test, feature = "dummy-module"))]
 mod test {
-    use crate::{dummy_module, embed_component_metadata};
-
     use super::*;
-    use std::path::Path;
-    use wit_parser::UnresolvedPackage;
+    use crate::{dummy_module, embed_component_metadata};
 
     #[test]
     fn it_renames_imports() {
         let mut resolve = Resolve::new();
-        let pkg = resolve
-            .push(
-                UnresolvedPackage::parse(
-                    Path::new("test.wit"),
-                    r#"
+        let pkgs = resolve
+            .push_str(
+                "test.wit",
+                r#"
 package test:wit;
 
 interface i {
@@ -2777,12 +2775,9 @@ world test {
     }
 }
 "#,
-                )
-                .unwrap(),
             )
             .unwrap();
-
-        let world = resolve.select_world(pkg, None).unwrap();
+        let world = resolve.select_world(&pkgs, None).unwrap();
 
         let mut module = dummy_module(&resolve, world);
 
