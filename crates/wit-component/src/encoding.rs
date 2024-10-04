@@ -655,8 +655,9 @@ impl<'a> EncodingState<'a> {
                         .insert(name.as_str(), core_name);
                     assert!(prev.is_none());
                 }
-                Export::Callback(..) => todo!(),
-                Export::WorldFuncPostReturn(..)
+                Export::WorldFuncCallback(..)
+                | Export::InterfaceFuncCallback(..)
+                | Export::WorldFuncPostReturn(..)
                 | Export::InterfaceFuncPostReturn(..)
                 | Export::ResourceDtor(..)
                 | Export::Memory
@@ -1048,6 +1049,10 @@ impl<'a> EncodingState<'a> {
             let post_return = self.core_alias_export(instance_index, post_return, ExportKind::Func);
             options.push(CanonicalOption::PostReturn(post_return));
         }
+        if let Some(callback) = exports.callback(key, func) {
+            let callback = self.core_alias_export(instance_index, callback, ExportKind::Func);
+            options.push(CanonicalOption::Callback(callback));
+        }
         let func_index = self.component.lift_func(core_func_index, ty, options);
         Ok(func_index)
     }
@@ -1430,7 +1435,7 @@ impl<'a> EncodingState<'a> {
         for_module: CustomModule<'_>,
         module: &str,
         field: &str,
-        import: &Import,
+        import: &'a Import,
     ) -> Result<(ExportKind, u32)> {
         log::trace!("attempting to materialize import of `{module}::{field}` for {for_module:?}");
         let resolve = &self.info.encoder.metadata.resolve;
@@ -1513,8 +1518,19 @@ impl<'a> EncodingState<'a> {
                     AbiVariant::GuestImport,
                 )
             }
-            Import::ErrorDrop => todo!(),
-            Import::TaskWait => todo!(),
+            Import::ErrorDrop => {
+                let index = self.component.error_drop();
+                return Ok((ExportKind::Func, index));
+            }
+            Import::TaskWait => {
+                let index = self.component.core_alias_export(
+                    self.shim_instance_index
+                        .expect("shim should be instantiated"),
+                    &shims.shims[&ShimKind::TaskWait].name,
+                    ExportKind::Func,
+                );
+                return Ok((ExportKind::Func, index));
+            }
             Import::FutureNew(_) => todo!(),
             Import::FutureSend(_) => todo!(),
             Import::FutureReceive(_) => todo!(),
@@ -1525,8 +1541,24 @@ impl<'a> EncodingState<'a> {
             Import::StreamReceive(_) => todo!(),
             Import::StreamDropSender(_) => todo!(),
             Import::StreamDropReceiver(_) => todo!(),
-            Import::ExportedTaskStart(_, _) => todo!(),
-            Import::ExportedTaskReturn(_, _) => todo!(),
+            Import::ExportedTaskStart(function) => {
+                let type_index = self
+                    .root_import_type_encoder(None)
+                    .encode_func_type(resolve, function)
+                    .unwrap();
+
+                let index = self.component.async_start(type_index);
+                return Ok((ExportKind::Func, index));
+            }
+            Import::ExportedTaskReturn(function) => {
+                let type_index = self
+                    .root_import_type_encoder(None)
+                    .encode_func_type(resolve, &function)
+                    .unwrap();
+
+                let index = self.component.async_return(type_index);
+                return Ok((ExportKind::Func, index));
+            }
             Import::WorldFunc(key, name, abi) => (key, name, None, *abi),
             Import::InterfaceFunc(key, _, name, abi) => {
                 (key, name, Some(resolve.name_world_key(key)), *abi)
@@ -1807,10 +1839,11 @@ impl<'a> Shims<'a> {
                 | Import::Item(_)
                 | Import::ExportedResourceDrop(..)
                 | Import::ExportedResourceRep(..)
-                | Import::ExportedResourceNew(..) => continue,
+                | Import::ExportedResourceNew(..)
+                | Import::ErrorDrop
+                | Import::ExportedTaskStart(..)
+                | Import::ExportedTaskReturn(..) => continue,
 
-                Import::ErrorDrop => todo!(),
-                Import::TaskWait => todo!(),
                 Import::FutureNew(_) => todo!(),
                 Import::FutureSend(_) => todo!(),
                 Import::FutureReceive(_) => todo!(),
@@ -1821,8 +1854,23 @@ impl<'a> Shims<'a> {
                 Import::StreamReceive(_) => todo!(),
                 Import::StreamDropSender(_) => todo!(),
                 Import::StreamDropReceiver(_) => todo!(),
-                Import::ExportedTaskStart(_, _) => todo!(),
-                Import::ExportedTaskReturn(_, _) => todo!(),
+
+                Import::TaskWait => {
+                    let name = self.shims.len().to_string();
+                    self.push(Shim {
+                        name,
+                        debug_name: "task-wait".to_string(),
+                        options: RequiredOptions::empty(),
+                        kind: ShimKind::TaskWait,
+                        sig: WasmSignature {
+                            params: vec![WasmType::I32],
+                            results: vec![WasmType::I32],
+                            indirect_params: false,
+                            retptr: false,
+                        },
+                    });
+                    continue;
+                }
 
                 // Adapter imports into the main module must got through an
                 // indirection, so that's registered here.

@@ -198,8 +198,8 @@ pub enum Import {
     StreamReceive(TypeId),
     StreamDropSender(TypeId),
     StreamDropReceiver(TypeId),
-    ExportedTaskStart(Option<InterfaceId>, String),
-    ExportedTaskReturn(Option<InterfaceId>, String),
+    ExportedTaskStart(Function),
+    ExportedTaskReturn(Function),
 }
 
 impl ImportMap {
@@ -357,12 +357,12 @@ impl ImportMap {
                 let interface_id = interface.as_ref().map(|(_, id)| *id);
                 let func = get_function(resolve, world, function_name, interface_id)?;
                 validate_task_start(resolve, ty, &func)?;
-                Some(Import::ExportedTaskStart(interface_id, func.name.clone()))
+                Some(Import::ExportedTaskStart(func))
             } else if let Some(function_name) = names.async_return_name(name) {
                 let interface_id = interface.as_ref().map(|(_, id)| *id);
                 let func = get_function(resolve, world, function_name, interface_id)?;
                 validate_task_return(resolve, ty, &func)?;
-                Some(Import::ExportedTaskReturn(interface_id, func.name.clone()))
+                Some(Import::ExportedTaskReturn(func))
             } else {
                 None
             })
@@ -587,7 +587,9 @@ pub enum Export {
     /// `cabi_realloc_adapter`
     ReallocForAdapter,
 
-    Callback(Option<InterfaceId>, String),
+    WorldFuncCallback(WorldKey),
+
+    InterfaceFuncCallback(WorldKey, String),
 }
 
 impl ExportMap {
@@ -682,9 +684,9 @@ impl ExportMap {
         }
 
         let (abi, name) = if let Some(name) = export.name.strip_prefix("[async]") {
-            (AbiVariant::GuestImportAsync, name)
+            (AbiVariant::GuestExportAsync, name)
         } else {
-            (AbiVariant::GuestImport, export.name)
+            (AbiVariant::GuestExport, export.name)
         };
 
         // Try to match this to a known WIT export that `exports` allows.
@@ -736,7 +738,11 @@ impl ExportMap {
                     &FuncType::new([ValType::I32; 4], [ValType::I32]),
                     ty,
                 )?;
-                return Ok(Some(Export::Callback(id, f.name.clone())));
+                return Ok(Some(if id.is_some() {
+                    Export::InterfaceFuncCallback(key.clone(), f.name.clone())
+                } else {
+                    Export::WorldFuncCallback(key.clone())
+                }));
             }
         }
 
@@ -750,12 +756,22 @@ impl ExportMap {
         Ok(None)
     }
 
-    /// Returns the name of the post-return export, if any, for the `interface`
-    /// and `func` combo.
+    /// Returns the name of the post-return export, if any, for the `key` and
+    /// `func` combo.
     pub fn post_return(&self, key: &WorldKey, func: &Function) -> Option<&str> {
         self.find(|m| match m {
             Export::WorldFuncPostReturn(k) => k == key,
             Export::InterfaceFuncPostReturn(k, f) => k == key && func.name == *f,
+            _ => false,
+        })
+    }
+
+    /// Returns the name of the async callback export, if any, for the `key` and
+    /// `func` combo.
+    pub fn callback(&self, key: &WorldKey, func: &Function) -> Option<&str> {
+        self.find(|m| match m {
+            Export::WorldFuncCallback(k) => k == key,
+            Export::InterfaceFuncCallback(k, f) => k == key && func.name == *f,
             _ => false,
         })
     }
