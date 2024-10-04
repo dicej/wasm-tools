@@ -2,6 +2,7 @@ use crate::encoding::{Instance, Item, LibraryInfo, MainOrAdapter};
 use crate::ComponentEncoder;
 use anyhow::{bail, Context, Result};
 use indexmap::{map::Entry, IndexMap, IndexSet};
+use std::hash::{Hash, Hasher};
 use std::mem;
 use wasm_encoder::ExportKind;
 use wasmparser::names::{ComponentName, ComponentNameKind};
@@ -116,6 +117,26 @@ pub enum ImportInstance {
     Names(IndexMap<String, Import>),
 }
 
+#[derive(Debug, Eq, PartialEq, Clone)]
+pub struct PayloadInfo {
+    pub name: String,
+    pub ty: TypeId,
+    pub function: Function,
+    pub key: WorldKey,
+    pub interface: Option<InterfaceId>,
+    pub imported: bool,
+}
+
+impl Hash for PayloadInfo {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+        self.ty.hash(state);
+        self.key.hash(state);
+        self.interface.hash(state);
+        self.imported.hash(state);
+    }
+}
+
 /// The different kinds of items that a module or an adapter can import.
 ///
 /// This is intended to be an exhaustive definition of what can be imported into
@@ -188,14 +209,14 @@ pub enum Import {
 
     ErrorDrop,
     TaskWait,
-    FutureNew(TypeId),
-    FutureSend(TypeId),
-    FutureReceive(TypeId),
+    FutureNew(PayloadInfo),
+    FutureSend(PayloadInfo),
+    FutureReceive(PayloadInfo),
     FutureDropSender(TypeId),
     FutureDropReceiver(TypeId),
-    StreamNew(TypeId),
-    StreamSend(TypeId),
-    StreamReceive(TypeId),
+    StreamNew(PayloadInfo),
+    StreamSend(PayloadInfo),
+    StreamReceive(PayloadInfo),
     StreamDropSender(TypeId),
     StreamDropReceiver(TypeId),
     ExportedTaskStart(Function),
@@ -355,12 +376,12 @@ impl ImportMap {
         let async_import = |interface: Option<(WorldKey, InterfaceId)>| {
             Ok::<_, anyhow::Error>(if let Some(function_name) = names.async_start_name(name) {
                 let interface_id = interface.as_ref().map(|(_, id)| *id);
-                let func = get_function(resolve, world, function_name, interface_id)?;
+                let func = get_function(resolve, world, function_name, interface_id, true)?;
                 validate_task_start(resolve, ty, &func)?;
                 Some(Import::ExportedTaskStart(func))
             } else if let Some(function_name) = names.async_return_name(name) {
                 let interface_id = interface.as_ref().map(|(_, id)| *id);
-                let func = get_function(resolve, world, function_name, interface_id)?;
+                let func = get_function(resolve, world, function_name, interface_id, true)?;
                 validate_task_return(resolve, ty, &func)?;
                 Some(Import::ExportedTaskReturn(func))
             } else {
@@ -683,7 +704,7 @@ impl ExportMap {
             return Ok(Some(Export::Initialize));
         }
 
-        let (abi, name) = if let Some(name) = export.name.strip_prefix("[async]") {
+        let (abi, name) = if let Some(name) = names.async_name(export.name) {
             (AbiVariant::GuestExportAsync, name)
         } else {
             (AbiVariant::GuestExport, export.name)
@@ -1014,15 +1035,19 @@ impl NameMangling for Standard {
         s.strip_suffix("_rep")
     }
     fn async_start_name<'a>(&self, s: &'a str) -> Option<&'a str> {
+        _ = s;
         None
     }
     fn async_return_name<'a>(&self, s: &'a str) -> Option<&'a str> {
+        _ = s;
         None
     }
     fn callback_name<'a>(&self, s: &'a str) -> Option<&'a str> {
+        _ = s;
         None
     }
     fn async_name<'a>(&self, s: &'a str) -> Option<&'a str> {
+        _ = s;
         None
     }
     fn error_drop(&self) -> Option<&str> {
@@ -1039,6 +1064,7 @@ impl NameMangling for Standard {
         world: &World,
         ty: &FuncType,
     ) -> Result<Option<Import>> {
+        _ = (module, name, resolve, world, ty);
         Ok(None)
     }
     fn module_to_interface(
@@ -1208,51 +1234,97 @@ impl NameMangling for Legacy {
                 .map(|v| (v, true))
                 .or_else(|| name.strip_prefix("[export-payload]").map(|v| (v, false)))
             {
-                let interface = if suffix == self.import_root() {
-                    None
+                let (key, interface) = if suffix == self.import_root() {
+                    (WorldKey::Name(name.to_string()), None)
                 } else {
-                    Some(self.module_to_interface(suffix, resolve, &world.exports)?.1)
+                    let (key, id) = self.module_to_interface(
+                        suffix,
+                        resolve,
+                        if imported {
+                            &world.imports
+                        } else {
+                            &world.exports
+                        },
+                    )?;
+                    (key, Some(id))
+                };
+
+                let orig_name = name;
+
+                // TODO: support synchronous send/receive calls
+                let (_async, name) = if let Some(name) = self.async_name(name) {
+                    (true, name)
+                } else {
+                    (false, name)
+                };
+
+                let info = |payload_key, validate: &dyn Fn(TypeId) -> Result<()>| {
+                    let (function, ty) =
+                        get_payload_type(resolve, world, &payload_key, interface, imported)?;
+                    validate(ty)?;
+                    Ok::<_, anyhow::Error>(PayloadInfo {
+                        name: orig_name.to_string(),
+                        ty,
+                        function,
+                        key: key.clone(),
+                        interface,
+                        imported,
+                    })
                 };
 
                 Some(
                     if let Some(key) = match_payload_prefix(name, "[future-new-") {
-                        validate_func_sig(name, &FuncType::new([ValType::I32], []), ty)?;
-                        Import::FutureNew(get_payload_type(resolve, world, key, interface)?)
+                        Import::FutureNew(info(key, &|_| {
+                            validate_func_sig(name, &FuncType::new([ValType::I32], []), ty)
+                        })?)
                     } else if let Some(key) = match_payload_prefix(name, "[future-send-") {
-                        let payload_type = get_payload_type(resolve, world, key, interface)?;
-                        validate_future_send(resolve, ty, payload_type)?;
-                        Import::FutureSend(payload_type)
+                        Import::FutureSend(info(key, &|payload_type| {
+                            validate_future_send(resolve, ty, payload_type)
+                        })?)
                     } else if let Some(key) = match_payload_prefix(name, "[future-receive-") {
-                        let payload_type = get_payload_type(resolve, world, key, interface)?;
-                        validate_future_receive(resolve, ty, payload_type)?;
-                        Import::FutureReceive(payload_type)
+                        Import::FutureReceive(info(key, &|payload_type| {
+                            validate_future_receive(resolve, ty, payload_type)
+                        })?)
                     } else if let Some(key) = match_payload_prefix(name, "[future-drop-sender-") {
-                        validate_func_sig(name, &FuncType::new([ValType::I32], []), ty)?;
-                        Import::FutureDropSender(get_payload_type(resolve, world, key, interface)?)
+                        Import::FutureDropSender(
+                            info(key, &|_| {
+                                validate_func_sig(name, &FuncType::new([ValType::I32], []), ty)
+                            })?
+                            .ty,
+                        )
                     } else if let Some(key) = match_payload_prefix(name, "[future-drop-receiver-") {
-                        validate_func_sig(name, &FuncType::new([ValType::I32], []), ty)?;
-                        Import::FutureDropReceiver(get_payload_type(
-                            resolve, world, key, interface,
-                        )?)
+                        Import::FutureDropReceiver(
+                            info(key, &|_| {
+                                validate_func_sig(name, &FuncType::new([ValType::I32], []), ty)
+                            })?
+                            .ty,
+                        )
                     } else if let Some(key) = match_payload_prefix(name, "[stream-new-") {
-                        validate_func_sig(name, &FuncType::new([ValType::I32], []), ty)?;
-                        Import::StreamNew(get_payload_type(resolve, world, key, interface)?)
+                        Import::StreamNew(info(key, &|_| {
+                            validate_func_sig(name, &FuncType::new([ValType::I32], []), ty)
+                        })?)
                     } else if let Some(key) = match_payload_prefix(name, "[stream-send-") {
-                        let payload_type = get_payload_type(resolve, world, key, interface)?;
-                        validate_stream_send(resolve, ty, payload_type)?;
-                        Import::StreamSend(payload_type)
+                        Import::StreamSend(info(key, &|payload_type| {
+                            validate_stream_send(resolve, ty, payload_type)
+                        })?)
                     } else if let Some(key) = match_payload_prefix(name, "[stream-receive-") {
-                        let payload_type = get_payload_type(resolve, world, key, interface)?;
-                        validate_stream_receive(resolve, ty, payload_type)?;
-                        Import::StreamReceive(payload_type)
+                        Import::StreamReceive(info(key, &|payload_type| {
+                            validate_stream_receive(resolve, ty, payload_type)
+                        })?)
                     } else if let Some(key) = match_payload_prefix(name, "[stream-drop-sender-") {
-                        validate_func_sig(name, &FuncType::new([ValType::I32], []), ty)?;
-                        Import::StreamDropSender(get_payload_type(resolve, world, key, interface)?)
+                        Import::StreamDropSender(
+                            info(key, &|_| {
+                                validate_func_sig(name, &FuncType::new([ValType::I32], []), ty)
+                            })?
+                            .ty,
+                        )
                     } else if let Some(key) = match_payload_prefix(name, "[stream-drop-receiver-") {
-                        validate_func_sig(name, &FuncType::new([ValType::I32], []), ty)?;
-                        Import::StreamDropReceiver(get_payload_type(
-                            resolve, world, key, interface,
-                        )?)
+                        Import::StreamDropReceiver(
+                            info(key, &|_| {
+                                validate_func_sig(name, &FuncType::new([ValType::I32], []), ty)
+                            })?
+                            .ty,
+                        )
                     } else {
                         bail!("unrecognized payload import: {name}");
                     },
@@ -1532,14 +1604,6 @@ fn validate_post_return(
     )
 }
 
-fn validate_callback(ty: &FuncType, func: &Function) -> Result<()> {
-    validate_func_sig(
-        &format!("{} callback", func.name),
-        &FuncType::new([ValType::I32; 4], [ValType::I32]),
-        ty,
-    )
-}
-
 fn validate_func_sig(name: &str, expected: &FuncType, ty: &wasmparser::FuncType) -> Result<()> {
     if ty != expected {
         bail!(
@@ -1567,10 +1631,13 @@ fn match_payload_prefix(name: &str, prefix: &str) -> Option<(String, usize)> {
 fn get_payload_type(
     resolve: &Resolve,
     world: &World,
-    (name, index): (String, usize),
+    (name, index): &(String, usize),
     interface: Option<InterfaceId>,
-) -> Result<TypeId> {
-    Ok(get_function(resolve, world, &name, interface)?.find_futures_and_streams(resolve)[index])
+    imported: bool,
+) -> Result<(Function, TypeId)> {
+    let function = get_function(resolve, world, name, interface, imported)?;
+    let ty = function.find_futures_and_streams(resolve)[*index];
+    Ok((function, ty))
 }
 
 fn get_function(
@@ -1578,6 +1645,7 @@ fn get_function(
     world: &World,
     name: &str,
     interface: Option<InterfaceId>,
+    imported: bool,
 ) -> Result<Function> {
     let function = if let Some(id) = interface {
         resolve.interfaces[id]
@@ -1585,9 +1653,14 @@ fn get_function(
             .get(name)
             .cloned()
             .map(WorldItem::Function)
-    } else {
+    } else if imported {
         world
             .imports
+            .get(&WorldKey::Name(name.to_string()))
+            .cloned()
+    } else {
+        world
+            .exports
             .get(&WorldKey::Name(name.to_string()))
             .cloned()
     };

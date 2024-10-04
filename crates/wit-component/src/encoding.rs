@@ -72,7 +72,7 @@
 //! component model.
 
 use crate::metadata::{self, Bindgen, ModuleMetadata};
-use crate::validation::{Export, ExportMap, Import, ImportInstance, ImportMap};
+use crate::validation::{Export, ExportMap, Import, ImportInstance, ImportMap, PayloadInfo};
 use crate::StringEncoding;
 use anyhow::{anyhow, bail, Context, Result};
 use indexmap::{IndexMap, IndexSet};
@@ -84,8 +84,8 @@ use wasm_encoder::*;
 use wasmparser::Validator;
 use wit_parser::{
     abi::{AbiVariant, WasmSignature, WasmType},
-    Function, FunctionKind, InterfaceId, LiveTypes, Resolve, Type, TypeDefKind, TypeId, TypeOwner,
-    WorldItem, WorldKey,
+    Function, FunctionKind, InterfaceId, LiveTypes, Resolve, Results, Stability, Type, TypeDefKind,
+    TypeId, TypeOwner, WorldItem, WorldKey,
 };
 
 const INDIRECT_TABLE_NAME: &str = "$imports";
@@ -1271,13 +1271,110 @@ impl<'a> EncodingState<'a> {
 
                 ShimKind::PayloadFunc {
                     for_module,
-                    module,
-                    imported,
-                    function,
-                    ordinal,
+                    info,
                     kind,
                 } => {
-                    todo!()
+                    let metadata = self.info.module_metadata_for(*for_module);
+                    let exports = self.info.exports_for(*for_module);
+                    let instance_index = self.instance_for(*for_module);
+                    let (encoding, realloc) = if info.imported {
+                        (
+                            metadata
+                                .import_encodings
+                                .get(resolve, &info.key, &info.function.name),
+                            exports.export_realloc_for(&info.key, &info.function),
+                        )
+                    } else {
+                        (
+                            metadata
+                                .export_encodings
+                                .get(resolve, &info.key, &info.function.name),
+                            exports.import_realloc_for(info.interface, &info.function.name),
+                        )
+                    };
+                    let encoding = encoding.unwrap_or(StringEncoding::UTF8);
+                    let realloc_index = realloc
+                        .map(|name| self.core_alias_export(instance_index, name, ExportKind::Func));
+                    let options = |me: &mut Self, params: Vec<Type>, results: Vec<Type>| {
+                        Ok::<_, anyhow::Error>(
+                            (RequiredOptions::for_import(
+                                resolve,
+                                &Function {
+                                    name: String::new(),
+                                    kind: FunctionKind::Freestanding,
+                                    params: params
+                                        .into_iter()
+                                        .enumerate()
+                                        .map(|(i, v)| (format!("a{i}"), v))
+                                        .collect(),
+                                    results: match &results[..] {
+                                        [] => Results::Named(Vec::new()),
+                                        [ty] => Results::Anon(*ty),
+                                        _ => unreachable!(),
+                                    },
+                                    docs: Default::default(),
+                                    stability: Stability::Unknown,
+                                },
+                                AbiVariant::GuestImportAsync,
+                            ) & !RequiredOptions::ASYNC)
+                                .into_iter(encoding, me.memory_index, realloc_index)?
+                                .collect::<Vec<_>>(),
+                        )
+                    };
+                    let type_index = self.payload_type_index(info.ty)?;
+
+                    match kind {
+                        PayloadFuncKind::FutureNew => self
+                            .component
+                            .future_new(type_index, self.memory_index.unwrap()),
+                        PayloadFuncKind::FutureSend => {
+                            let TypeDefKind::Future(payload_type) = &resolve.types[info.ty].kind
+                            else {
+                                unreachable!()
+                            };
+                            let options = options(
+                                self,
+                                if let Some(payload_type) = payload_type {
+                                    vec![Type::U32, *payload_type]
+                                } else {
+                                    vec![Type::U32]
+                                },
+                                vec![Type::Id(unit_result.unwrap())],
+                            )?;
+                            self.component.future_send(type_index, options)
+                        }
+                        PayloadFuncKind::FutureReceive => {
+                            let options = options(
+                                self,
+                                vec![Type::U32],
+                                vec![Type::Id(payload_results[&info.ty])],
+                            )?;
+                            self.component.future_receive(type_index, options)
+                        }
+                        PayloadFuncKind::StreamNew => self
+                            .component
+                            .stream_new(type_index, self.memory_index.unwrap()),
+                        PayloadFuncKind::StreamSend => {
+                            let TypeDefKind::Stream(payload_type) = &resolve.types[info.ty].kind
+                            else {
+                                unreachable!()
+                            };
+                            let options = options(
+                                self,
+                                vec![Type::U32, *payload_type],
+                                vec![Type::Id(unit_result.unwrap())],
+                            )?;
+                            self.component.stream_send(type_index, options)
+                        }
+                        PayloadFuncKind::StreamReceive => {
+                            let options = options(
+                                self,
+                                vec![Type::Id(info.ty)],
+                                vec![Type::Id(payload_results[&info.ty])],
+                            )?;
+                            self.component.stream_receive(type_index, options)
+                        }
+                    }
                 }
 
                 ShimKind::TaskWait => self.component.task_wait(self.memory_index.unwrap()),
@@ -1292,6 +1389,17 @@ impl<'a> EncodingState<'a> {
             [("", ModuleArg::Instance(instance_index))],
         );
         Ok(())
+    }
+
+    fn payload_type_index(&mut self, ty: TypeId) -> Result<u32> {
+        let resolve = &self.info.encoder.metadata.resolve;
+        let ComponentValType::Type(type_index) = self
+            .root_import_type_encoder(None)
+            .encode_valtype(resolve, &Type::Id(ty))?
+        else {
+            unreachable!()
+        };
+        Ok(type_index)
     }
 
     /// This is a helper function that will declare, in the component itself,
@@ -1439,6 +1547,18 @@ impl<'a> EncodingState<'a> {
     ) -> Result<(ExportKind, u32)> {
         log::trace!("attempting to materialize import of `{module}::{field}` for {for_module:?}");
         let resolve = &self.info.encoder.metadata.resolve;
+        let payload_indirect = |me: &mut Self, info, kind| {
+            me.component.core_alias_export(
+                me.shim_instance_index.expect("shim should be instantiated"),
+                &shims.shims[&ShimKind::PayloadFunc {
+                    for_module,
+                    info,
+                    kind,
+                }]
+                    .name,
+                ExportKind::Func,
+            )
+        };
         let name_tmp;
         let (key, name, interface_key, abi) = match import {
             // Main module dependencies on an adapter in use are done with an
@@ -1531,16 +1651,62 @@ impl<'a> EncodingState<'a> {
                 );
                 return Ok((ExportKind::Func, index));
             }
-            Import::FutureNew(_) => todo!(),
-            Import::FutureSend(_) => todo!(),
-            Import::FutureReceive(_) => todo!(),
-            Import::FutureDropSender(_) => todo!(),
-            Import::FutureDropReceiver(_) => todo!(),
-            Import::StreamNew(_) => todo!(),
-            Import::StreamSend(_) => todo!(),
-            Import::StreamReceive(_) => todo!(),
-            Import::StreamDropSender(_) => todo!(),
-            Import::StreamDropReceiver(_) => todo!(),
+            Import::FutureNew(info) => {
+                return Ok((
+                    ExportKind::Func,
+                    payload_indirect(self, info, PayloadFuncKind::FutureNew),
+                ));
+            }
+            Import::FutureSend(info) => {
+                return Ok((
+                    ExportKind::Func,
+                    payload_indirect(self, info, PayloadFuncKind::FutureSend),
+                ));
+            }
+            Import::FutureReceive(info) => {
+                return Ok((
+                    ExportKind::Func,
+                    payload_indirect(self, info, PayloadFuncKind::FutureReceive),
+                ));
+            }
+            Import::FutureDropSender(ty) => {
+                let type_index = self.payload_type_index(*ty)?;
+                let index = self.component.future_drop_sender(type_index);
+                return Ok((ExportKind::Func, index));
+            }
+            Import::FutureDropReceiver(ty) => {
+                let type_index = self.payload_type_index(*ty)?;
+                let index = self.component.future_drop_receiver(type_index);
+                return Ok((ExportKind::Func, index));
+            }
+            Import::StreamNew(info) => {
+                return Ok((
+                    ExportKind::Func,
+                    payload_indirect(self, info, PayloadFuncKind::StreamNew),
+                ));
+            }
+            Import::StreamSend(info) => {
+                return Ok((
+                    ExportKind::Func,
+                    payload_indirect(self, info, PayloadFuncKind::StreamSend),
+                ));
+            }
+            Import::StreamReceive(info) => {
+                return Ok((
+                    ExportKind::Func,
+                    payload_indirect(self, info, PayloadFuncKind::StreamReceive),
+                ));
+            }
+            Import::StreamDropSender(ty) => {
+                let type_index = self.payload_type_index(*ty)?;
+                let index = self.component.stream_drop_sender(type_index);
+                return Ok((ExportKind::Func, index));
+            }
+            Import::StreamDropReceiver(ty) => {
+                let type_index = self.payload_type_index(*ty)?;
+                let index = self.component.stream_drop_receiver(type_index);
+                return Ok((ExportKind::Func, index));
+            }
             Import::ExportedTaskStart(function) => {
                 let type_index = self
                     .root_import_type_encoder(None)
@@ -1786,10 +1952,7 @@ enum ShimKind<'a> {
     },
     PayloadFunc {
         for_module: CustomModule<'a>,
-        module: &'a str,
-        imported: bool,
-        function: &'a str,
-        ordinal: usize,
+        info: &'a PayloadInfo,
         kind: PayloadFuncKind,
     },
     TaskWait,
@@ -1829,6 +1992,27 @@ impl<'a> Shims<'a> {
         let metadata = world.module_metadata_for(for_module);
         let resolve = &world.encoder.metadata.resolve;
 
+        let payload_push = |me: &mut Self, module, info: &'a PayloadInfo, kind, params, results| {
+            let debug_name = format!("{module}-{}", info.name);
+            let name = me.shims.len().to_string();
+            me.push(Shim {
+                name,
+                debug_name,
+                options: RequiredOptions::empty(),
+                kind: ShimKind::PayloadFunc {
+                    for_module,
+                    info,
+                    kind,
+                },
+                sig: WasmSignature {
+                    params,
+                    results,
+                    indirect_params: false,
+                    retptr: false,
+                },
+            });
+        };
+
         for (module, field, import) in module_imports.imports() {
             let (key, name, interface_key) = match import {
                 // These imports don't require shims, they can be satisfied
@@ -1842,18 +2026,78 @@ impl<'a> Shims<'a> {
                 | Import::ExportedResourceNew(..)
                 | Import::ErrorDrop
                 | Import::ExportedTaskStart(..)
-                | Import::ExportedTaskReturn(..) => continue,
+                | Import::ExportedTaskReturn(..)
+                | Import::FutureDropSender(..)
+                | Import::FutureDropReceiver(..)
+                | Import::StreamDropSender(..)
+                | Import::StreamDropReceiver(..) => continue,
 
-                Import::FutureNew(_) => todo!(),
-                Import::FutureSend(_) => todo!(),
-                Import::FutureReceive(_) => todo!(),
-                Import::FutureDropSender(_) => todo!(),
-                Import::FutureDropReceiver(_) => todo!(),
-                Import::StreamNew(_) => todo!(),
-                Import::StreamSend(_) => todo!(),
-                Import::StreamReceive(_) => todo!(),
-                Import::StreamDropSender(_) => todo!(),
-                Import::StreamDropReceiver(_) => todo!(),
+                Import::FutureNew(info) => {
+                    payload_push(
+                        self,
+                        module,
+                        info,
+                        PayloadFuncKind::FutureNew,
+                        vec![WasmType::I32],
+                        Vec::new(),
+                    );
+                    continue;
+                }
+                Import::FutureSend(info) => {
+                    payload_push(
+                        self,
+                        module,
+                        info,
+                        PayloadFuncKind::FutureSend,
+                        vec![WasmType::I32; 3],
+                        vec![WasmType::I32],
+                    );
+                    continue;
+                }
+                Import::FutureReceive(info) => {
+                    payload_push(
+                        self,
+                        module,
+                        info,
+                        PayloadFuncKind::FutureReceive,
+                        vec![WasmType::I32; 3],
+                        vec![WasmType::I32],
+                    );
+                    continue;
+                }
+                Import::StreamNew(info) => {
+                    payload_push(
+                        self,
+                        module,
+                        info,
+                        PayloadFuncKind::StreamNew,
+                        vec![WasmType::I32],
+                        Vec::new(),
+                    );
+                    continue;
+                }
+                Import::StreamSend(info) => {
+                    payload_push(
+                        self,
+                        module,
+                        info,
+                        PayloadFuncKind::StreamSend,
+                        vec![WasmType::I32; 3],
+                        vec![WasmType::I32],
+                    );
+                    continue;
+                }
+                Import::StreamReceive(info) => {
+                    payload_push(
+                        self,
+                        module,
+                        info,
+                        PayloadFuncKind::StreamReceive,
+                        vec![WasmType::I32; 3],
+                        vec![WasmType::I32],
+                    );
+                    continue;
+                }
 
                 Import::TaskWait => {
                     let name = self.shims.len().to_string();
