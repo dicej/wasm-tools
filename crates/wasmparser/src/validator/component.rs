@@ -1057,21 +1057,7 @@ impl ComponentState {
         Ok(())
     }
 
-    pub fn async_start(
-        &mut self,
-        component_type_index: u32,
-        types: &mut TypeAlloc,
-        offset: usize,
-    ) -> Result<()> {
-        let mut component_type = self
-            .function_type_at(component_type_index, types, offset)?
-            .clone();
-        component_type.results = Vec::from(mem::replace(&mut component_type.params, Box::new([])))
-            .into_iter()
-            .map(|(k, v)| (Some(k), v))
-            .collect();
-        let info = component_type.lower(types, true, false);
-
+    pub fn task_backpressure(&mut self, types: &mut TypeAlloc, offset: usize) -> Result<()> {
         let (_is_new, group_id) = types.intern_canonical_rec_group(RecGroup::implicit(
             offset,
             SubType {
@@ -1079,10 +1065,7 @@ impl ComponentState {
                 supertype_idx: None,
                 composite_type: CompositeType {
                     shared: false,
-                    inner: CompositeInnerType::Func(FuncType::new(
-                        info.params.iter(),
-                        info.results.iter(),
-                    )),
+                    inner: CompositeInnerType::Func(FuncType::new([ValType::I32], [])),
                 },
             },
         ));
@@ -1091,26 +1074,14 @@ impl ComponentState {
         Ok(())
     }
 
-    pub fn async_return(
-        &mut self,
-        component_type_index: u32,
-        types: &mut TypeAlloc,
-        offset: usize,
-    ) -> Result<()> {
-        let mut component_type = self
-            .function_type_at(component_type_index, types, offset)?
-            .clone();
-        component_type.params = Vec::from(mem::replace(&mut component_type.results, Box::new([])))
-            .into_iter()
-            .enumerate()
-            .map(|(index, (k, v))| {
-                (
-                    k.unwrap_or_else(|| KebabString::new(format!("p{index}")).unwrap()),
-                    v,
-                )
-            })
-            .collect();
-        let info = component_type.lower(types, true, false);
+    pub fn task_return(&mut self, type_index: u32, offset: usize) -> Result<()> {
+        let id = self.type_id_at(type_index, offset)?.clone();
+        self.core_funcs.push(id);
+        Ok(())
+    }
+
+    pub fn task_wait(&mut self, memory: u32, types: &mut TypeAlloc, offset: usize) -> Result<()> {
+        self.memory_at(memory, offset)?;
 
         let (_is_new, group_id) = types.intern_canonical_rec_group(RecGroup::implicit(
             offset,
@@ -1119,10 +1090,60 @@ impl ComponentState {
                 supertype_idx: None,
                 composite_type: CompositeType {
                     shared: false,
-                    inner: CompositeInnerType::Func(FuncType::new(
-                        info.params.iter(),
-                        info.results.iter(),
-                    )),
+                    inner: CompositeInnerType::Func(FuncType::new([ValType::I32], [ValType::I32])),
+                },
+            },
+        ));
+        let id = types[group_id].start;
+        self.core_funcs.push(id);
+        Ok(())
+    }
+
+    pub fn task_poll(&mut self, memory: u32, types: &mut TypeAlloc, offset: usize) -> Result<()> {
+        self.memory_at(memory, offset)?;
+
+        let (_is_new, group_id) = types.intern_canonical_rec_group(RecGroup::implicit(
+            offset,
+            SubType {
+                is_final: true,
+                supertype_idx: None,
+                composite_type: CompositeType {
+                    shared: false,
+                    inner: CompositeInnerType::Func(FuncType::new([ValType::I32], [ValType::I32])),
+                },
+            },
+        ));
+        let id = types[group_id].start;
+        self.core_funcs.push(id);
+        Ok(())
+    }
+
+    pub fn task_yield(&mut self, types: &mut TypeAlloc, offset: usize) -> Result<()> {
+        let (_is_new, group_id) = types.intern_canonical_rec_group(RecGroup::implicit(
+            offset,
+            SubType {
+                is_final: true,
+                supertype_idx: None,
+                composite_type: CompositeType {
+                    shared: false,
+                    inner: CompositeInnerType::Func(FuncType::new([], [])),
+                },
+            },
+        ));
+        let id = types[group_id].start;
+        self.core_funcs.push(id);
+        Ok(())
+    }
+
+    pub fn subtask_drop(&mut self, types: &mut TypeAlloc, offset: usize) -> Result<()> {
+        let (_is_new, group_id) = types.intern_canonical_rec_group(RecGroup::implicit(
+            offset,
+            SubType {
+                is_final: true,
+                supertype_idx: None,
+                composite_type: CompositeType {
+                    shared: false,
+                    inner: CompositeInnerType::Func(FuncType::new([ValType::I32], [])),
                 },
             },
         ));
@@ -1420,25 +1441,6 @@ impl ComponentState {
                 composite_type: CompositeType {
                     shared: false,
                     inner: CompositeInnerType::Func(FuncType::new([ValType::I32], [])),
-                },
-            },
-        ));
-        let id = types[group_id].start;
-        self.core_funcs.push(id);
-        Ok(())
-    }
-
-    pub fn task_wait(&mut self, memory: u32, types: &mut TypeAlloc, offset: usize) -> Result<()> {
-        self.memory_at(memory, offset)?;
-
-        let (_is_new, group_id) = types.intern_canonical_rec_group(RecGroup::implicit(
-            offset,
-            SubType {
-                is_final: true,
-                supertype_idx: None,
-                composite_type: CompositeType {
-                    shared: false,
-                    inner: CompositeInnerType::Func(FuncType::new([ValType::I32], [ValType::I32])),
                 },
             },
         ));

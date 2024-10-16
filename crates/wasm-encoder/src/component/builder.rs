@@ -385,14 +385,38 @@ impl ComponentBuilder {
     }
 
     /// TODO: docs
-    pub fn async_start(&mut self, ty: u32) -> u32 {
-        self.canonical_functions().async_start(ty);
+    pub fn task_backpressure(&mut self) -> u32 {
+        self.canonical_functions().task_backpressure();
         inc(&mut self.core_funcs)
     }
 
     /// TODO: docs
-    pub fn async_return(&mut self, ty: u32) -> u32 {
-        self.canonical_functions().async_return(ty);
+    pub fn task_return(&mut self, ty: u32) -> u32 {
+        self.canonical_functions().task_return(ty);
+        inc(&mut self.core_funcs)
+    }
+
+    /// TODO: docs
+    pub fn task_wait(&mut self, memory: u32) -> u32 {
+        self.canonical_functions().task_wait(memory);
+        inc(&mut self.core_funcs)
+    }
+
+    /// TODO: docs
+    pub fn task_poll(&mut self, memory: u32) -> u32 {
+        self.canonical_functions().task_poll(memory);
+        inc(&mut self.core_funcs)
+    }
+
+    /// TODO: docs
+    pub fn task_yield(&mut self) -> u32 {
+        self.canonical_functions().task_yield();
+        inc(&mut self.core_funcs)
+    }
+
+    /// TODO: docs
+    pub fn subtask_drop(&mut self) -> u32 {
+        self.canonical_functions().subtask_drop();
         inc(&mut self.core_funcs)
     }
 
@@ -475,12 +499,6 @@ impl ComponentBuilder {
     /// TODO: docs
     pub fn error_drop(&mut self) -> u32 {
         self.canonical_functions().error_drop();
-        inc(&mut self.core_funcs)
-    }
-
-    /// TODO: docs
-    pub fn task_wait(&mut self, memory: u32) -> u32 {
-        self.canonical_functions().task_wait(memory);
         inc(&mut self.core_funcs)
     }
 

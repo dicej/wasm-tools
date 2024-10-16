@@ -422,8 +422,12 @@ impl<'a> Dump<'a> {
                             | CanonicalFunction::ThreadHwConcurrency => {
                                 ("core func", &mut i.core_funcs)
                             }
-                            CanonicalFunction::AsyncStart { .. }
-                            | CanonicalFunction::AsyncReturn { .. }
+                            CanonicalFunction::TaskBackpressure
+                            | CanonicalFunction::TaskReturn { .. }
+                            | CanonicalFunction::TaskWait { .. }
+                            | CanonicalFunction::TaskPoll { .. }
+                            | CanonicalFunction::TaskYield
+                            | CanonicalFunction::SubtaskDrop
                             | CanonicalFunction::FutureNew { .. }
                             | CanonicalFunction::FutureSend { .. }
                             | CanonicalFunction::FutureReceive { .. }
@@ -434,7 +438,6 @@ impl<'a> Dump<'a> {
                             | CanonicalFunction::StreamReceive { .. }
                             | CanonicalFunction::StreamDropSender { .. }
                             | CanonicalFunction::StreamDropReceiver { .. }
-                            | CanonicalFunction::TaskWait { .. }
                             | CanonicalFunction::ErrorDrop => ("core func", &mut i.core_funcs),
                         };
 

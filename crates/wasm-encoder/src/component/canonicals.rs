@@ -174,7 +174,14 @@ impl CanonicalFunctionSection {
     }
 
     /// TODO: docs
-    pub fn async_start(&mut self, ty: u32) -> &mut Self {
+    pub fn task_backpressure(&mut self) -> &mut Self {
+        self.bytes.push(0x08);
+        self.num_added += 1;
+        self
+    }
+
+    /// TODO: docs
+    pub fn task_return(&mut self, ty: u32) -> &mut Self {
         self.bytes.push(0x09);
         ty.encode(&mut self.bytes);
         self.num_added += 1;
@@ -182,9 +189,31 @@ impl CanonicalFunctionSection {
     }
 
     /// TODO: docs
-    pub fn async_return(&mut self, ty: u32) -> &mut Self {
+    pub fn task_wait(&mut self, memory: u32) -> &mut Self {
         self.bytes.push(0x0a);
-        ty.encode(&mut self.bytes);
+        memory.encode(&mut self.bytes);
+        self.num_added += 1;
+        self
+    }
+
+    /// TODO: docs
+    pub fn task_poll(&mut self, memory: u32) -> &mut Self {
+        self.bytes.push(0x0b);
+        memory.encode(&mut self.bytes);
+        self.num_added += 1;
+        self
+    }
+
+    /// TODO: docs
+    pub fn task_yield(&mut self) -> &mut Self {
+        self.bytes.push(0x0c);
+        self.num_added += 1;
+        self
+    }
+
+    /// TODO: docs
+    pub fn subtask_drop(&mut self) -> &mut Self {
+        self.bytes.push(0x0d);
         self.num_added += 1;
         self
     }
@@ -310,14 +339,6 @@ impl CanonicalFunctionSection {
     /// TODO: docs
     pub fn error_drop(&mut self) -> &mut Self {
         self.bytes.push(0xf5);
-        self.num_added += 1;
-        self
-    }
-
-    /// TODO: docs
-    pub fn task_wait(&mut self, memory: u32) -> &mut Self {
-        self.bytes.push(0x0b);
-        memory.encode(&mut self.bytes);
         self.num_added += 1;
         self
     }

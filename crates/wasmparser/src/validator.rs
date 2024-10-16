@@ -1259,12 +1259,20 @@ impl Validator {
                     crate::CanonicalFunction::ThreadHwConcurrency => {
                         current.thread_hw_concurrency(types, offset, features)
                     }
-                    crate::CanonicalFunction::AsyncStart {
-                        component_type_index,
-                    } => current.async_start(component_type_index, types, offset),
-                    crate::CanonicalFunction::AsyncReturn {
-                        component_type_index,
-                    } => current.async_return(component_type_index, types, offset),
+                    crate::CanonicalFunction::TaskBackpressure => {
+                        current.task_backpressure(types, offset)
+                    }
+                    crate::CanonicalFunction::TaskReturn { type_index } => {
+                        current.task_return(type_index, offset)
+                    }
+                    crate::CanonicalFunction::TaskWait { memory } => {
+                        current.task_wait(memory, types, offset)
+                    }
+                    crate::CanonicalFunction::TaskPoll { memory } => {
+                        current.task_poll(memory, types, offset)
+                    }
+                    crate::CanonicalFunction::TaskYield => current.task_yield(types, offset),
+                    crate::CanonicalFunction::SubtaskDrop => current.subtask_drop(types, offset),
                     crate::CanonicalFunction::FutureNew { ty, memory } => {
                         current.future_new(ty, memory, types, offset)
                     }
@@ -1296,9 +1304,6 @@ impl Validator {
                         current.stream_drop_receiver(ty, types, offset)
                     }
                     crate::CanonicalFunction::ErrorDrop => current.error_drop(types, offset),
-                    crate::CanonicalFunction::TaskWait { memory } => {
-                        current.task_wait(memory, types, offset)
-                    }
                 }
             },
         )

@@ -84,8 +84,8 @@ use wasm_encoder::*;
 use wasmparser::Validator;
 use wit_parser::{
     abi::{AbiVariant, WasmSignature, WasmType},
-    Function, FunctionKind, InterfaceId, LiveTypes, Resolve, Results, Stability, Type, TypeDefKind,
-    TypeId, TypeOwner, WorldItem, WorldKey,
+    Docs, Function, FunctionKind, InterfaceId, LiveTypes, Resolve, Results, Stability, Type,
+    TypeDefKind, TypeId, TypeOwner, WorldItem, WorldKey,
 };
 
 const INDIRECT_TABLE_NAME: &str = "$imports";
@@ -1378,6 +1378,7 @@ impl<'a> EncodingState<'a> {
                 }
 
                 ShimKind::TaskWait => self.component.task_wait(self.memory_index.unwrap()),
+                ShimKind::TaskPoll => self.component.task_poll(self.memory_index.unwrap()),
             };
 
             exports.push((shim.name.as_str(), ExportKind::Func, core_func_index));
@@ -1642,6 +1643,10 @@ impl<'a> EncodingState<'a> {
                 let index = self.component.error_drop();
                 return Ok((ExportKind::Func, index));
             }
+            Import::TaskBackpressure => {
+                let index = self.component.task_backpressure();
+                return Ok((ExportKind::Func, index));
+            }
             Import::TaskWait => {
                 let index = self.component.core_alias_export(
                     self.shim_instance_index
@@ -1649,6 +1654,23 @@ impl<'a> EncodingState<'a> {
                     &shims.shims[&ShimKind::TaskWait].name,
                     ExportKind::Func,
                 );
+                return Ok((ExportKind::Func, index));
+            }
+            Import::TaskPoll => {
+                let index = self.component.core_alias_export(
+                    self.shim_instance_index
+                        .expect("shim should be instantiated"),
+                    &shims.shims[&ShimKind::TaskPoll].name,
+                    ExportKind::Func,
+                );
+                return Ok((ExportKind::Func, index));
+            }
+            Import::TaskYield => {
+                let index = self.component.task_yield();
+                return Ok((ExportKind::Func, index));
+            }
+            Import::SubtaskDrop => {
+                let index = self.component.subtask_drop();
                 return Ok((ExportKind::Func, index));
             }
             Import::FutureNew(info) => {
@@ -1707,23 +1729,38 @@ impl<'a> EncodingState<'a> {
                 let index = self.component.stream_drop_receiver(type_index);
                 return Ok((ExportKind::Func, index));
             }
-            Import::ExportedTaskStart(function) => {
-                let type_index = self
-                    .root_import_type_encoder(None)
-                    .encode_func_type(resolve, function)
-                    .unwrap();
-
-                let index = self.component.async_start(type_index);
-                return Ok((ExportKind::Func, index));
-            }
             Import::ExportedTaskReturn(function) => {
-                let type_index = self
-                    .root_import_type_encoder(None)
-                    .encode_func_type(resolve, &function)
-                    .unwrap();
+                let signature = resolve.wasm_signature(
+                    AbiVariant::GuestImport,
+                    &Function {
+                        name: String::new(),
+                        kind: FunctionKind::Freestanding,
+                        params: match &function.results {
+                            Results::Named(params) => params.clone(),
+                            Results::Anon(ty) => vec![("v".to_string(), *ty)],
+                        },
+                        results: Results::Named(Vec::new()),
+                        docs: Docs::default(),
+                        stability: Stability::Unknown,
+                    },
+                );
+                let (type_index, encoder) = self.component.core_type();
+                encoder.core().function(
+                    signature.params.into_iter().map(into_val_type),
+                    signature.results.into_iter().map(into_val_type),
+                );
 
-                let index = self.component.async_return(type_index);
+                let index = self.component.task_return(type_index);
                 return Ok((ExportKind::Func, index));
+
+                fn into_val_type(ty: WasmType) -> ValType {
+                    match ty {
+                        WasmType::I32 | WasmType::Pointer | WasmType::Length => ValType::I32,
+                        WasmType::I64 | WasmType::PointerOrI64 => ValType::I64,
+                        WasmType::F32 => ValType::F32,
+                        WasmType::F64 => ValType::F64,
+                    }
+                }
             }
             Import::WorldFunc(key, name, abi) => (key, name, None, *abi),
             Import::InterfaceFunc(key, _, name, abi) => {
@@ -1956,6 +1993,7 @@ enum ShimKind<'a> {
         kind: PayloadFuncKind,
     },
     TaskWait,
+    TaskPoll,
 }
 
 /// Indicator for which module is being used for a lowering or where options
@@ -2025,7 +2063,9 @@ impl<'a> Shims<'a> {
                 | Import::ExportedResourceRep(..)
                 | Import::ExportedResourceNew(..)
                 | Import::ErrorDrop
-                | Import::ExportedTaskStart(..)
+                | Import::TaskBackpressure
+                | Import::TaskYield
+                | Import::SubtaskDrop
                 | Import::ExportedTaskReturn(..)
                 | Import::FutureDropSender(..)
                 | Import::FutureDropReceiver(..)
@@ -2106,6 +2146,23 @@ impl<'a> Shims<'a> {
                         debug_name: "task-wait".to_string(),
                         options: RequiredOptions::empty(),
                         kind: ShimKind::TaskWait,
+                        sig: WasmSignature {
+                            params: vec![WasmType::I32],
+                            results: vec![WasmType::I32],
+                            indirect_params: false,
+                            retptr: false,
+                        },
+                    });
+                    continue;
+                }
+
+                Import::TaskPoll => {
+                    let name = self.shims.len().to_string();
+                    self.push(Shim {
+                        name,
+                        debug_name: "task-poll".to_string(),
+                        options: RequiredOptions::empty(),
+                        kind: ShimKind::TaskPoll,
                         sig: WasmSignature {
                             params: vec![WasmType::I32],
                             results: vec![WasmType::I32],

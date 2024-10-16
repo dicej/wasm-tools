@@ -73,15 +73,26 @@ pub enum CanonicalFunction {
     /// execute concurrently
     ThreadHwConcurrency,
     /// TODO: docs
-    AsyncStart {
+    TaskBackpressure,
+    /// TODO: docs
+    TaskReturn {
         /// TODO: docs
-        component_type_index: u32,
+        type_index: u32,
     },
     /// TODO: docs
-    AsyncReturn {
+    TaskWait {
         /// TODO: docs
-        component_type_index: u32,
+        memory: u32,
     },
+    /// TODO: docs
+    TaskPoll {
+        /// TODO: docs
+        memory: u32,
+    },
+    /// TODO: docs
+    TaskYield,
+    /// TODO: docs
+    SubtaskDrop,
     /// TODO: docs
     FutureNew {
         /// TODO: docs
@@ -146,11 +157,6 @@ pub enum CanonicalFunction {
     },
     /// TODO: docs
     ErrorDrop,
-    /// TODO: docs
-    TaskWait {
-        /// TODO: docs
-        memory: u32,
-    },
 }
 
 /// A reader for the canonical section of a WebAssembly component.
@@ -196,12 +202,18 @@ impl<'a> FromReader<'a> for CanonicalFunction {
                 func_ty_index: reader.read()?,
             },
             0x06 => CanonicalFunction::ThreadHwConcurrency,
-            0x09 => CanonicalFunction::AsyncStart {
-                component_type_index: reader.read()?,
+            0x08 => CanonicalFunction::TaskBackpressure,
+            0x09 => CanonicalFunction::TaskReturn {
+                type_index: reader.read()?,
             },
-            0x0a => CanonicalFunction::AsyncReturn {
-                component_type_index: reader.read()?,
+            0x0a => CanonicalFunction::TaskWait {
+                memory: reader.read()?,
             },
+            0x0b => CanonicalFunction::TaskPoll {
+                memory: reader.read()?,
+            },
+            0x0c => CanonicalFunction::TaskYield,
+            0x0d => CanonicalFunction::SubtaskDrop,
             0xff => CanonicalFunction::FutureNew {
                 ty: reader.read()?,
                 memory: reader.read()?,
@@ -239,9 +251,6 @@ impl<'a> FromReader<'a> for CanonicalFunction {
             0xf7 => CanonicalFunction::StreamDropSender { ty: reader.read()? },
             0xf6 => CanonicalFunction::StreamDropReceiver { ty: reader.read()? },
             0xf5 => CanonicalFunction::ErrorDrop,
-            0x0b => CanonicalFunction::TaskWait {
-                memory: reader.read()?,
-            },
             x => return reader.invalid_leading_byte(x, "canonical function"),
         })
     }

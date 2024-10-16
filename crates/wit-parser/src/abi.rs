@@ -137,24 +137,13 @@ impl Resolve {
     /// The first entry returned is the list of parameters and the second entry
     /// is the list of results for the wasm function signature.
     pub fn wasm_signature(&self, variant: AbiVariant, func: &Function) -> WasmSignature {
-        match variant {
-            AbiVariant::GuestExportAsync => {
-                return WasmSignature {
-                    params: Vec::new(),
-                    indirect_params: false,
-                    results: vec![WasmType::Pointer],
-                    retptr: false,
-                }
-            }
-            AbiVariant::GuestImportAsync => {
-                return WasmSignature {
-                    params: vec![WasmType::Pointer; 3],
-                    indirect_params: true,
-                    results: vec![WasmType::I32],
-                    retptr: true,
-                }
-            }
-            _ => {}
+        if let AbiVariant::GuestImportAsync = variant {
+            return WasmSignature {
+                params: vec![WasmType::Pointer; 2],
+                indirect_params: true,
+                results: vec![WasmType::I32],
+                retptr: true,
+            };
         }
 
         const MAX_FLAT_PARAMS: usize = 16;
@@ -173,7 +162,10 @@ impl Resolve {
         } else {
             if matches!(
                 (&func.kind, variant),
-                (crate::FunctionKind::Method(_), AbiVariant::GuestExport)
+                (
+                    crate::FunctionKind::Method(_),
+                    AbiVariant::GuestExport | AbiVariant::GuestExportAsync
+                )
             ) {
                 // Guest exported methods always receive resource rep as first argument
                 //
@@ -184,6 +176,15 @@ impl Resolve {
                 assert!(matches!(params[0], WasmType::I32));
                 params[0] = WasmType::Pointer;
             }
+        }
+
+        if let AbiVariant::GuestExportAsync = variant {
+            return WasmSignature {
+                params,
+                indirect_params,
+                results: vec![WasmType::Pointer],
+                retptr: false,
+            };
         }
 
         let mut results = Vec::new();

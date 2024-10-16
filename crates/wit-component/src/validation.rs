@@ -208,7 +208,11 @@ pub enum Import {
     Item(Item),
 
     ErrorDrop,
+    TaskBackpressure,
     TaskWait,
+    TaskPoll,
+    TaskYield,
+    SubtaskDrop,
     FutureNew(PayloadInfo),
     FutureSend(PayloadInfo),
     FutureReceive(PayloadInfo),
@@ -219,7 +223,6 @@ pub enum Import {
     StreamReceive(PayloadInfo),
     StreamDropSender(TypeId),
     StreamDropReceiver(TypeId),
-    ExportedTaskStart(Function),
     ExportedTaskReturn(Function),
 }
 
@@ -374,12 +377,7 @@ impl ImportMap {
         }
 
         let async_import = |interface: Option<(WorldKey, InterfaceId)>| {
-            Ok::<_, anyhow::Error>(if let Some(function_name) = names.async_start_name(name) {
-                let interface_id = interface.as_ref().map(|(_, id)| *id);
-                let func = get_function(resolve, world, function_name, interface_id, true)?;
-                validate_task_start(resolve, ty, &func)?;
-                Some(Import::ExportedTaskStart(func))
-            } else if let Some(function_name) = names.async_return_name(name) {
+            Ok::<_, anyhow::Error>(if let Some(function_name) = names.task_return_name(name) {
                 let interface_id = interface.as_ref().map(|(_, id)| *id);
                 let func = get_function(resolve, world, function_name, interface_id, true)?;
                 validate_task_return(resolve, ty, &func)?;
@@ -397,11 +395,39 @@ impl ImportMap {
 
         if module == names.import_root() {
             if Some(name) == names.error_drop() {
+                let expected = FuncType::new([ValType::I32], []);
+                validate_func_sig(name, &expected, ty)?;
                 return Ok(Import::ErrorDrop);
             }
 
+            if Some(name) == names.task_backpressure() {
+                let expected = FuncType::new([ValType::I32], []);
+                validate_func_sig(name, &expected, ty)?;
+                return Ok(Import::TaskBackpressure);
+            }
+
             if Some(name) == names.task_wait() {
+                let expected = FuncType::new([ValType::I32], [ValType::I32]);
+                validate_func_sig(name, &expected, ty)?;
                 return Ok(Import::TaskWait);
+            }
+
+            if Some(name) == names.task_poll() {
+                let expected = FuncType::new([ValType::I32], [ValType::I32]);
+                validate_func_sig(name, &expected, ty)?;
+                return Ok(Import::TaskPoll);
+            }
+
+            if Some(name) == names.task_yield() {
+                let expected = FuncType::new([], []);
+                validate_func_sig(name, &expected, ty)?;
+                return Ok(Import::TaskYield);
+            }
+
+            if Some(name) == names.subtask_drop() {
+                let expected = FuncType::new([ValType::I32], []);
+                validate_func_sig(name, &expected, ty)?;
+                return Ok(Import::SubtaskDrop);
             }
 
             if let Some(import) = async_import(None)? {
@@ -963,12 +989,15 @@ trait NameMangling {
     fn resource_drop_name<'a>(&self, s: &'a str) -> Option<&'a str>;
     fn resource_new_name<'a>(&self, s: &'a str) -> Option<&'a str>;
     fn resource_rep_name<'a>(&self, s: &'a str) -> Option<&'a str>;
-    fn async_start_name<'a>(&self, s: &'a str) -> Option<&'a str>;
-    fn async_return_name<'a>(&self, s: &'a str) -> Option<&'a str>;
+    fn task_return_name<'a>(&self, s: &'a str) -> Option<&'a str>;
+    fn task_backpressure(&self) -> Option<&str>;
+    fn task_wait(&self) -> Option<&str>;
+    fn task_poll(&self) -> Option<&str>;
+    fn task_yield(&self) -> Option<&str>;
+    fn subtask_drop(&self) -> Option<&str>;
     fn callback_name<'a>(&self, s: &'a str) -> Option<&'a str>;
     fn async_name<'a>(&self, s: &'a str) -> Option<&'a str>;
     fn error_drop(&self) -> Option<&str>;
-    fn task_wait(&self) -> Option<&str>;
     fn payload_import(
         &self,
         module: &str,
@@ -1034,12 +1063,23 @@ impl NameMangling for Standard {
     fn resource_rep_name<'a>(&self, s: &'a str) -> Option<&'a str> {
         s.strip_suffix("_rep")
     }
-    fn async_start_name<'a>(&self, s: &'a str) -> Option<&'a str> {
+    fn task_return_name<'a>(&self, s: &'a str) -> Option<&'a str> {
         _ = s;
         None
     }
-    fn async_return_name<'a>(&self, s: &'a str) -> Option<&'a str> {
-        _ = s;
+    fn task_backpressure(&self) -> Option<&str> {
+        None
+    }
+    fn task_wait(&self) -> Option<&str> {
+        None
+    }
+    fn task_poll(&self) -> Option<&str> {
+        None
+    }
+    fn task_yield(&self) -> Option<&str> {
+        None
+    }
+    fn subtask_drop(&self) -> Option<&str> {
         None
     }
     fn callback_name<'a>(&self, s: &'a str) -> Option<&'a str> {
@@ -1051,9 +1091,6 @@ impl NameMangling for Standard {
         None
     }
     fn error_drop(&self) -> Option<&str> {
-        None
-    }
-    fn task_wait(&self) -> Option<&str> {
         None
     }
     fn payload_import(
@@ -1202,11 +1239,23 @@ impl NameMangling for Legacy {
     fn resource_rep_name<'a>(&self, s: &'a str) -> Option<&'a str> {
         s.strip_prefix("[resource-rep]")
     }
-    fn async_start_name<'a>(&self, s: &'a str) -> Option<&'a str> {
-        s.strip_prefix("[async-start]")
+    fn task_return_name<'a>(&self, s: &'a str) -> Option<&'a str> {
+        s.strip_prefix("[task-return]")
     }
-    fn async_return_name<'a>(&self, s: &'a str) -> Option<&'a str> {
-        s.strip_prefix("[async-return]")
+    fn task_backpressure(&self) -> Option<&str> {
+        Some("[task-backpressure]")
+    }
+    fn task_wait(&self) -> Option<&str> {
+        Some("[task-wait]")
+    }
+    fn task_poll(&self) -> Option<&str> {
+        Some("[task-poll]")
+    }
+    fn task_yield(&self) -> Option<&str> {
+        Some("[task-yield]")
+    }
+    fn subtask_drop(&self) -> Option<&str> {
+        Some("[subtask-drop]")
     }
     fn callback_name<'a>(&self, s: &'a str) -> Option<&'a str> {
         s.strip_prefix("[callback][async]")
@@ -1216,9 +1265,6 @@ impl NameMangling for Legacy {
     }
     fn error_drop(&self) -> Option<&str> {
         Some("[error-drop]")
-    }
-    fn task_wait(&self) -> Option<&str> {
-        Some("[task-wait]")
     }
     fn payload_import(
         &self,
@@ -1691,12 +1737,6 @@ fn validate_stream_send(resolve: &Resolve, ty: &FuncType, payload_type: TypeId) 
 fn validate_stream_receive(resolve: &Resolve, ty: &FuncType, payload_type: TypeId) -> Result<()> {
     // TODO
     _ = (resolve, ty, payload_type);
-    Ok(())
-}
-
-fn validate_task_start(resolve: &Resolve, ty: &FuncType, function: &Function) -> Result<()> {
-    // TODO
-    _ = (resolve, ty, function);
     Ok(())
 }
 

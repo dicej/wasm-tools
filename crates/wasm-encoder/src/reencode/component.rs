@@ -959,15 +959,23 @@ pub mod component_utils {
             wasmparser::CanonicalFunction::ThreadHwConcurrency => {
                 section.thread_hw_concurrency();
             }
-            wasmparser::CanonicalFunction::AsyncStart {
-                component_type_index,
-            } => {
-                section.async_start(reencoder.component_type_index(component_type_index));
+            wasmparser::CanonicalFunction::TaskBackpressure => {
+                section.task_backpressure();
             }
-            wasmparser::CanonicalFunction::AsyncReturn {
-                component_type_index,
-            } => {
-                section.async_return(reencoder.component_type_index(component_type_index));
+            wasmparser::CanonicalFunction::TaskReturn { type_index } => {
+                section.task_return(reencoder.type_index(type_index));
+            }
+            wasmparser::CanonicalFunction::TaskWait { memory } => {
+                section.task_wait(reencoder.memory_index(memory));
+            }
+            wasmparser::CanonicalFunction::TaskPoll { memory } => {
+                section.task_poll(reencoder.memory_index(memory));
+            }
+            wasmparser::CanonicalFunction::TaskYield => {
+                section.task_yield();
+            }
+            wasmparser::CanonicalFunction::SubtaskDrop => {
+                section.subtask_drop();
             }
             wasmparser::CanonicalFunction::FutureNew { ty, memory } => {
                 section.future_new(
@@ -1019,9 +1027,6 @@ pub mod component_utils {
             }
             wasmparser::CanonicalFunction::ErrorDrop => {
                 section.error_drop();
-            }
-            wasmparser::CanonicalFunction::TaskWait { memory } => {
-                section.task_wait(reencoder.memory_index(memory));
             }
         }
         Ok(())
