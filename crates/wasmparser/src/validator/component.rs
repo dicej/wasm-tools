@@ -1200,7 +1200,7 @@ impl ComponentState {
                 composite_type: CompositeType {
                     shared: false,
                     inner: CompositeInnerType::Func(FuncType::new(
-                        [ValType::I32; 3],
+                        [ValType::I32; 2],
                         [ValType::I32],
                     )),
                 },
@@ -1233,7 +1233,7 @@ impl ComponentState {
                 composite_type: CompositeType {
                     shared: false,
                     inner: CompositeInnerType::Func(FuncType::new(
-                        [ValType::I32; 3],
+                        [ValType::I32; 2],
                         [ValType::I32],
                     )),
                 },
@@ -1340,7 +1340,7 @@ impl ComponentState {
                 composite_type: CompositeType {
                     shared: false,
                     inner: CompositeInnerType::Func(FuncType::new(
-                        [ValType::I32; 3],
+                        [ValType::I32; 2],
                         [ValType::I32],
                     )),
                 },
@@ -1373,7 +1373,7 @@ impl ComponentState {
                 composite_type: CompositeType {
                     shared: false,
                     inner: CompositeInnerType::Func(FuncType::new(
-                        [ValType::I32; 3],
+                        [ValType::I32; 2],
                         [ValType::I32],
                     )),
                 },

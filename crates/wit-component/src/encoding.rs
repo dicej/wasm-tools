@@ -2089,7 +2089,7 @@ impl<'a> Shims<'a> {
                         module,
                         info,
                         PayloadFuncKind::FutureSend,
-                        vec![WasmType::I32; 3],
+                        vec![WasmType::I32; 2],
                         vec![WasmType::I32],
                     );
                     continue;
@@ -2100,7 +2100,7 @@ impl<'a> Shims<'a> {
                         module,
                         info,
                         PayloadFuncKind::FutureReceive,
-                        vec![WasmType::I32; 3],
+                        vec![WasmType::I32; 2],
                         vec![WasmType::I32],
                     );
                     continue;
@@ -2122,7 +2122,7 @@ impl<'a> Shims<'a> {
                         module,
                         info,
                         PayloadFuncKind::StreamSend,
-                        vec![WasmType::I32; 3],
+                        vec![WasmType::I32; 2],
                         vec![WasmType::I32],
                     );
                     continue;
@@ -2133,7 +2133,7 @@ impl<'a> Shims<'a> {
                         module,
                         info,
                         PayloadFuncKind::StreamReceive,
-                        vec![WasmType::I32; 3],
+                        vec![WasmType::I32; 2],
                         vec![WasmType::I32],
                     );
                     continue;
