@@ -2594,6 +2594,9 @@ impl ComponentEncoder {
             .raw_custom_section(&crate::base_producers().raw_custom_section());
         let bytes = state.component.finish();
 
+        // TODO dicej: remove this:
+        std::fs::write("/tmp/foo.wasm", &bytes).unwrap();
+
         if self.validate {
             Validator::new()
                 .validate_all(&bytes)

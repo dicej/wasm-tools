@@ -1146,17 +1146,13 @@ impl ComponentFuncType {
     pub(crate) fn lower(&self, types: &TypeList, is_lower: bool, async_: bool) -> LoweringInfo {
         let mut info = LoweringInfo::default();
 
-        if async_ {
-            if is_lower {
-                for _ in 0..3 {
-                    info.params.push(ValType::I32);
-                }
-                info.results.push(ValType::I32);
-                info.requires_memory = true;
-                info.requires_realloc = self.results.iter().any(|(_, ty)| ty.contains_ptr(types));
-            } else {
-                info.results.push(ValType::I32);
+        if async_ && is_lower {
+            for _ in 0..2 {
+                info.params.push(ValType::I32);
             }
+            info.results.push(ValType::I32);
+            info.requires_memory = true;
+            info.requires_realloc = self.results.iter().any(|(_, ty)| ty.contains_ptr(types));
             return info;
         }
 
@@ -1193,27 +1189,31 @@ impl ComponentFuncType {
             }
         }
 
-        for (_, ty) in self.results.iter() {
-            // Results of lowered functions that contains pointers must be
-            // allocated by the callee meaning that realloc is required.
-            // Results of lifted function are allocated by the guest which
-            // means that no realloc option is necessary.
-            if is_lower && !info.requires_realloc {
-                info.requires_realloc = ty.contains_ptr(types);
-            }
-
-            if !ty.push_wasm_types(types, &mut info.results) {
-                // Too many results to return directly, either a retptr parameter will be used (import)
-                // or a single pointer will be returned (export)
-                info.results.clear();
-                if is_lower {
-                    info.params.max = MAX_LOWERED_TYPES;
-                    assert!(info.params.push(ValType::I32));
-                } else {
-                    assert!(info.results.push(ValType::I32));
+        if async_ {
+            info.results.push(ValType::I32);
+        } else {
+            for (_, ty) in self.results.iter() {
+                // Results of lowered functions that contains pointers must be
+                // allocated by the callee meaning that realloc is required.
+                // Results of lifted function are allocated by the guest which
+                // means that no realloc option is necessary.
+                if is_lower && !info.requires_realloc {
+                    info.requires_realloc = ty.contains_ptr(types);
                 }
-                info.requires_memory = true;
-                break;
+
+                if !ty.push_wasm_types(types, &mut info.results) {
+                    // Too many results to return directly, either a retptr parameter will be used (import)
+                    // or a single pointer will be returned (export)
+                    info.results.clear();
+                    if is_lower {
+                        info.params.max = MAX_LOWERED_TYPES;
+                        assert!(info.params.push(ValType::I32));
+                    } else {
+                        assert!(info.results.push(ValType::I32));
+                    }
+                    info.requires_memory = true;
+                    break;
+                }
             }
         }
 
