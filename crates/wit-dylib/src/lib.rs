@@ -103,6 +103,12 @@ struct WitExport<'a> {
     async_task_return_index: Option<u32>,
 }
 
+struct PayloadData {
+    module: String,
+    function: String,
+    ordinal: usize,
+}
+
 impl Adapter {
     pub fn encode(&mut self, resolve: &Resolve, world_id: WorldId) -> Vec<u8> {
         self.sizes.fill(resolve);
@@ -121,9 +127,12 @@ impl Adapter {
         self.exports
             .export("cabi_realloc", ExportKind::Func, cabi_realloc);
 
+        let mut payload_data = HashMap::new();
+        collect_payload_data(resolve, world_id, &mut payload_data);
+
         // Generate/add metadata for all functions that are either imported or
         // exported.
-        self.bindgen_world(resolve, world_id, &imports);
+        self.bindgen_world(resolve, world_id, &imports, &payload_data);
 
         // Now that all functions have been learned about the metadata data
         // segment can be finalized and emitted. Here this additionally invokes
@@ -405,7 +414,13 @@ impl Adapter {
         });
     }
 
-    fn bindgen_world(&mut self, resolve: &Resolve, world_id: WorldId, imports: &Imports<'_>) {
+    fn bindgen_world(
+        &mut self,
+        resolve: &Resolve,
+        world_id: WorldId,
+        imports: &Imports<'_>,
+        payload_data: &HashMap<TypeId, PayloadData>,
+    ) {
         let world = &resolve.worlds[world_id];
 
         // Build up a map for all types of all imports. This pushes all type
@@ -431,7 +446,7 @@ impl Adapter {
                 TypeOwner::Interface(id) => Some(interface_names[&id]),
                 _ => None,
             };
-            self.register_type(resolve, key, ty);
+            self.register_type(resolve, key, ty, payload_data);
         }
 
         // Using the populated type map for imports generate functions to invoke
@@ -471,7 +486,7 @@ impl Adapter {
                 TypeOwner::Interface(id) => Some(export_names[&id]),
                 _ => None,
             };
-            self.register_type(resolve, key, ty);
+            self.register_type(resolve, key, ty, payload_data);
 
             if let Some(index) = self.resource_map.get(&ty) {
                 self.bindgen_world_export_resource_dtor(resolve, key.unwrap(), ty, *index);
@@ -490,7 +505,13 @@ impl Adapter {
     /// This will insert `id` into metadata and build up the interpreter data
     /// structures for it. The end-result is the population of `self.type_map`
     /// here.
-    fn register_type(&mut self, resolve: &Resolve, key: Option<&WorldKey>, id: TypeId) {
+    fn register_type(
+        &mut self,
+        resolve: &Resolve,
+        key: Option<&WorldKey>,
+        id: TypeId,
+        payload_data: &HashMap<TypeId, PayloadData>,
+    ) {
         let ty = &resolve.types[id];
         let interface = key.map(|key| resolve.name_world_key(key));
         let name = ty.name.clone();
@@ -604,21 +625,155 @@ impl Adapter {
             }
             TypeDefKind::Future(t) => {
                 let index = self.metadata.futures.len();
+
+                let Some(PayloadData {
+                    module,
+                    function,
+                    ordinal,
+                }) = payload_data.get(&id)
+                else {
+                    // Such a type can't be used with `wit-component` currently.
+                    panic!("encountered future type not used in any function")
+                };
+
+                let import = |me: &mut Self, name, params, results| {
+                    let ty = me.define_ty(params, results);
+                    let import =
+                        me.import_func(module, &format!("[future-{name}-{ordinal}]{function}"), ty);
+                    me.push_elem(import)
+                };
+
+                let new_elem_index = import(self, "new", vec![], vec![ValType::I64]);
+                let read_elem_index =
+                    import(self, "read", vec![ValType::I32; 2], vec![ValType::I32]);
+                let write_elem_index =
+                    import(self, "write", vec![ValType::I32; 2], vec![ValType::I32]);
+                let cancel_read_elem_index =
+                    import(self, "cancel-read", vec![ValType::I32], vec![ValType::I32]);
+                let cancel_write_elem_index =
+                    import(self, "cancel-write", vec![ValType::I32], vec![ValType::I32]);
+                let drop_readable_elem_index =
+                    import(self, "drop-readable", vec![ValType::I32], vec![]);
+                let drop_writable_elem_index =
+                    import(self, "drop-writable", vec![ValType::I32], vec![]);
+
+                let lift_elem_index = t.map(|t| {
+                    let ty = self.define_ty([ValType::I32; 2], []);
+                    let func = bindgen::lift_payload(self, resolve, t);
+                    let func = self.define_func(
+                        &format!("[future-lift-{ordinal}]{function}"),
+                        ty,
+                        func,
+                        false,
+                    );
+                    self.push_elem(func)
+                });
+
+                let lower_elem_index = t.map(|t| {
+                    let ty = self.define_ty([ValType::I32; 2], []);
+                    let func = bindgen::lower_payload(self, resolve, t);
+                    let func = self.define_func(
+                        &format!("[future-lower-{ordinal}]{function}"),
+                        ty,
+                        func,
+                        false,
+                    );
+                    self.push_elem(func)
+                });
+
                 self.metadata.futures.push(metadata::Future {
                     id,
                     interface,
                     name,
                     ty: t.map(|t| self.lookup_ty(&t)),
+                    new_elem_index,
+                    read_elem_index,
+                    write_elem_index,
+                    cancel_read_elem_index,
+                    cancel_write_elem_index,
+                    drop_readable_elem_index,
+                    drop_writable_elem_index,
+                    lift_elem_index,
+                    lower_elem_index,
+                    abi_payload_size: t.map(|t| self.sizes.size(&t).size_wasm32()).unwrap_or(0),
+                    abi_payload_align: t.map(|t| self.sizes.align(&t).align_wasm32()).unwrap_or(1),
                 });
                 metadata::Type::Future(index)
             }
             TypeDefKind::Stream(t) => {
                 let index = self.metadata.streams.len();
+
+                let Some(PayloadData {
+                    module,
+                    function,
+                    ordinal,
+                }) = payload_data.get(&id)
+                else {
+                    // Such a type can't be used with `wit-component` currently.
+                    panic!("encountered stream type not used in any function")
+                };
+
+                let import = |me: &mut Self, name, params, results| {
+                    let ty = me.define_ty(params, results);
+                    let import =
+                        me.import_func(module, &format!("[stream-{name}-{ordinal}]{function}"), ty);
+                    me.push_elem(import)
+                };
+
+                let new_elem_index = import(self, "new", vec![], vec![ValType::I64]);
+                let read_elem_index =
+                    import(self, "read", vec![ValType::I32; 3], vec![ValType::I32]);
+                let write_elem_index =
+                    import(self, "write", vec![ValType::I32; 3], vec![ValType::I32]);
+                let cancel_read_elem_index =
+                    import(self, "cancel-read", vec![ValType::I32], vec![ValType::I32]);
+                let cancel_write_elem_index =
+                    import(self, "cancel-write", vec![ValType::I32], vec![ValType::I32]);
+                let drop_readable_elem_index =
+                    import(self, "drop-readable", vec![ValType::I32], vec![]);
+                let drop_writable_elem_index =
+                    import(self, "drop-writable", vec![ValType::I32], vec![]);
+
+                let lift_elem_index = t.map(|t| {
+                    let ty = self.define_ty([ValType::I32; 2], []);
+                    let func = bindgen::lift_payload(self, resolve, t);
+                    let func = self.define_func(
+                        &format!("[stream-lift-{ordinal}]{function}"),
+                        ty,
+                        func,
+                        false,
+                    );
+                    self.push_elem(func)
+                });
+
+                let lower_elem_index = t.map(|t| {
+                    let ty = self.define_ty([ValType::I32; 2], []);
+                    let func = bindgen::lower_payload(self, resolve, t);
+                    let func = self.define_func(
+                        &format!("[stream-lower-{ordinal}]{function}"),
+                        ty,
+                        func,
+                        false,
+                    );
+                    self.push_elem(func)
+                });
+
                 self.metadata.streams.push(metadata::Stream {
                     id,
                     interface,
                     name,
                     ty: t.map(|t| self.lookup_ty(&t)),
+                    new_elem_index,
+                    read_elem_index,
+                    write_elem_index,
+                    cancel_read_elem_index,
+                    cancel_write_elem_index,
+                    drop_readable_elem_index,
+                    drop_writable_elem_index,
+                    lift_elem_index,
+                    lower_elem_index,
+                    abi_payload_size: t.map(|t| self.sizes.size(&t).size_wasm32()).unwrap_or(0),
+                    abi_payload_align: t.map(|t| self.sizes.align(&t).align_wasm32()).unwrap_or(1),
                 });
                 metadata::Type::Stream(index)
             }
@@ -1110,6 +1265,72 @@ fn dealias(resolve: &Resolve, mut id: TypeId) -> TypeId {
         match resolve.types[id].kind {
             TypeDefKind::Type(Type::Id(other)) => id = other,
             _ => break id,
+        }
+    }
+}
+
+fn collect_payload_data_for_func(
+    resolve: &Resolve,
+    interface: Option<&WorldKey>,
+    func: &wit_parser::Function,
+    prefix: &str,
+    data: &mut HashMap<TypeId, PayloadData>,
+) {
+    for (ordinal, ty) in func
+        .find_futures_and_streams(resolve)
+        .into_iter()
+        .enumerate()
+    {
+        match &resolve.types[ty].kind {
+            TypeDefKind::Future(_) | TypeDefKind::Stream(_) => {
+                data.entry(ty).or_insert_with(|| PayloadData {
+                    module: format!(
+                        "{prefix}{}",
+                        interface
+                            .map(|name| resolve.name_world_key(name))
+                            .unwrap_or_else(|| "$root".into())
+                    ),
+                    function: func.name.clone(),
+                    ordinal,
+                });
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+fn collect_payload_data(
+    resolve: &Resolve,
+    world_id: WorldId,
+    data: &mut HashMap<TypeId, PayloadData>,
+) {
+    let world = &resolve.worlds[world_id];
+
+    for (key, import) in world.imports.iter() {
+        match import {
+            WorldItem::Interface { id, .. } => {
+                for (_, func) in resolve.interfaces[*id].functions.iter() {
+                    collect_payload_data_for_func(resolve, Some(key), func, "", data);
+                }
+            }
+            WorldItem::Type(_) => {}
+            WorldItem::Function(func) => {
+                collect_payload_data_for_func(resolve, None, func, "", data);
+            }
+        }
+    }
+
+    for (key, export) in world.exports.iter() {
+        match export {
+            WorldItem::Interface { id, .. } => {
+                for (_, func) in resolve.interfaces[*id].functions.iter() {
+                    collect_payload_data_for_func(resolve, Some(key), func, "[export]", data);
+                }
+            }
+            WorldItem::Type(_) => unreachable!(),
+            WorldItem::Function(func) => {
+                collect_payload_data_for_func(resolve, None, func, "[export]", data);
+            }
         }
     }
 }
