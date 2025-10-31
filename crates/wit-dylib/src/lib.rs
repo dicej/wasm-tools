@@ -104,9 +104,15 @@ struct WitExport<'a> {
 }
 
 struct PayloadData {
-    module: String,
-    function: String,
+    new_elem_index: u32,
+    read_elem_index: u32,
+    write_elem_index: u32,
+    cancel_read_elem_index: u32,
+    cancel_write_elem_index: u32,
+    drop_readable_elem_index: u32,
+    drop_writable_elem_index: u32,
     ordinal: usize,
+    function: String,
 }
 
 impl Adapter {
@@ -118,6 +124,10 @@ impl Adapter {
         // import intrinsics necessary for exported resources, for example, as
         // well.
         let imports = self.add_imports(resolve, world_id);
+
+        let mut payload_data = HashMap::new();
+        self.collect_payload_data(resolve, world_id, &mut payload_data);
+
         self.imports_done = true;
 
         // Ensure that `cabi_realloc` is reexported from our module to indicate
@@ -126,9 +136,6 @@ impl Adapter {
         let cabi_realloc = self.intrinsics().cabi_realloc;
         self.exports
             .export("cabi_realloc", ExportKind::Func, cabi_realloc);
-
-        let mut payload_data = HashMap::new();
-        collect_payload_data(resolve, world_id, &mut payload_data);
 
         // Generate/add metadata for all functions that are either imported or
         // exported.
@@ -173,6 +180,125 @@ impl Adapter {
 
     fn resource_intrinsic_mangling(&mut self) -> ManglingAndAbi {
         ManglingAndAbi::Legacy(LiftLowerAbi::Sync)
+    }
+
+    fn collect_payload_data_for_func(
+        &mut self,
+        resolve: &Resolve,
+        interface: Option<&WorldKey>,
+        func: &wit_parser::Function,
+        prefix: &str,
+        data: &mut HashMap<TypeId, PayloadData>,
+    ) {
+        let mut make = |arg_count, kind, ordinal| {
+            let module = format!(
+                "{prefix}{}",
+                interface
+                    .map(|name| resolve.name_world_key(name))
+                    .unwrap_or_else(|| "$root".into())
+            );
+            let function = func.name.clone();
+
+            let import = |me: &mut Self, name, params, results| {
+                let ty = me.define_ty(params, results);
+                let import =
+                    me.import_func(&module, &format!("[{kind}-{name}-{ordinal}]{function}"), ty);
+                me.push_elem(import)
+            };
+
+            let new_elem_index = import(self, "new", vec![], vec![ValType::I64]);
+            let read_elem_index = import(
+                self,
+                "read",
+                vec![ValType::I32; arg_count],
+                vec![ValType::I32],
+            );
+            let write_elem_index = import(
+                self,
+                "write",
+                vec![ValType::I32; arg_count],
+                vec![ValType::I32],
+            );
+            let cancel_read_elem_index =
+                import(self, "cancel-read", vec![ValType::I32], vec![ValType::I32]);
+            let cancel_write_elem_index =
+                import(self, "cancel-write", vec![ValType::I32], vec![ValType::I32]);
+            let drop_readable_elem_index =
+                import(self, "drop-readable", vec![ValType::I32], vec![]);
+            let drop_writable_elem_index =
+                import(self, "drop-writable", vec![ValType::I32], vec![]);
+
+            PayloadData {
+                new_elem_index,
+                read_elem_index,
+                write_elem_index,
+                cancel_read_elem_index,
+                cancel_write_elem_index,
+                drop_readable_elem_index,
+                drop_writable_elem_index,
+                ordinal,
+                function,
+            }
+        };
+
+        for (ordinal, ty) in func
+            .find_futures_and_streams(resolve)
+            .into_iter()
+            .enumerate()
+        {
+            match &resolve.types[ty].kind {
+                TypeDefKind::Future(_) => {
+                    data.entry(ty).or_insert_with(|| make(2, "future", ordinal))
+                }
+                TypeDefKind::Stream(_) => {
+                    data.entry(ty).or_insert_with(|| make(3, "stream", ordinal))
+                }
+                _ => unreachable!(),
+            };
+        }
+    }
+
+    fn collect_payload_data(
+        &mut self,
+        resolve: &Resolve,
+        world_id: WorldId,
+        data: &mut HashMap<TypeId, PayloadData>,
+    ) {
+        let world = &resolve.worlds[world_id];
+
+        for (key, import) in world.imports.iter() {
+            match import {
+                WorldItem::Interface { id, .. } => {
+                    for (_, func) in resolve.interfaces[*id].functions.iter() {
+                        self.collect_payload_data_for_func(resolve, Some(key), func, "", data);
+                    }
+                }
+                WorldItem::Type(_) => {}
+                WorldItem::Function(func) => {
+                    self.collect_payload_data_for_func(resolve, None, func, "", data);
+                }
+            }
+        }
+
+        for (key, export) in world.exports.iter() {
+            match export {
+                WorldItem::Interface { id, .. } => {
+                    for (_, func) in resolve.interfaces[*id].functions.iter() {
+                        self.collect_payload_data_for_func(
+                            resolve,
+                            Some(key),
+                            func,
+                            "[export]",
+                            data,
+                        );
+                    }
+                }
+                WorldItem::Type(_) => unreachable!(),
+                WorldItem::Function(func) => {
+                    self.collect_payload_data_for_func(resolve, None, func, "[export]", data);
+                }
+            }
+        }
     }
 
     fn add_imports<'a>(&mut self, resolve: &'a Resolve, world_id: WorldId) -> Imports<'a> {
@@ -326,7 +452,7 @@ impl Adapter {
             }
 
             // No other types with intrinsics at this time (futures/streams are
-            // relative to where they show up in function types.
+            // relative to where they show up in function types).
             _ => {}
         }
     }
@@ -626,36 +752,21 @@ impl Adapter {
             TypeDefKind::Future(t) => {
                 let index = self.metadata.futures.len();
 
-                let Some(PayloadData {
-                    module,
-                    function,
+                let Some(&PayloadData {
+                    new_elem_index,
+                    read_elem_index,
+                    write_elem_index,
+                    cancel_read_elem_index,
+                    cancel_write_elem_index,
+                    drop_readable_elem_index,
+                    drop_writable_elem_index,
                     ordinal,
+                    ref function,
                 }) = payload_data.get(&id)
                 else {
                     // Such a type can't be used with `wit-component` currently.
                     panic!("encountered future type not used in any function")
                 };
-
-                let import = |me: &mut Self, name, params, results| {
-                    let ty = me.define_ty(params, results);
-                    let import =
-                        me.import_func(module, &format!("[future-{name}-{ordinal}]{function}"), ty);
-                    me.push_elem(import)
-                };
-
-                let new_elem_index = import(self, "new", vec![], vec![ValType::I64]);
-                let read_elem_index =
-                    import(self, "read", vec![ValType::I32; 2], vec![ValType::I32]);
-                let write_elem_index =
-                    import(self, "write", vec![ValType::I32; 2], vec![ValType::I32]);
-                let cancel_read_elem_index =
-                    import(self, "cancel-read", vec![ValType::I32], vec![ValType::I32]);
-                let cancel_write_elem_index =
-                    import(self, "cancel-write", vec![ValType::I32], vec![ValType::I32]);
-                let drop_readable_elem_index =
-                    import(self, "drop-readable", vec![ValType::I32], vec![]);
-                let drop_writable_elem_index =
-                    import(self, "drop-writable", vec![ValType::I32], vec![]);
 
                 let lift_elem_index = t.map(|t| {
                     let ty = self.define_ty([ValType::I32; 2], []);
@@ -703,36 +814,21 @@ impl Adapter {
             TypeDefKind::Stream(t) => {
                 let index = self.metadata.streams.len();
 
-                let Some(PayloadData {
-                    module,
-                    function,
+                let Some(&PayloadData {
+                    new_elem_index,
+                    read_elem_index,
+                    write_elem_index,
+                    cancel_read_elem_index,
+                    cancel_write_elem_index,
+                    drop_readable_elem_index,
+                    drop_writable_elem_index,
                     ordinal,
+                    ref function,
                 }) = payload_data.get(&id)
                 else {
                     // Such a type can't be used with `wit-component` currently.
                     panic!("encountered stream type not used in any function")
                 };
-
-                let import = |me: &mut Self, name, params, results| {
-                    let ty = me.define_ty(params, results);
-                    let import =
-                        me.import_func(module, &format!("[stream-{name}-{ordinal}]{function}"), ty);
-                    me.push_elem(import)
-                };
-
-                let new_elem_index = import(self, "new", vec![], vec![ValType::I64]);
-                let read_elem_index =
-                    import(self, "read", vec![ValType::I32; 3], vec![ValType::I32]);
-                let write_elem_index =
-                    import(self, "write", vec![ValType::I32; 3], vec![ValType::I32]);
-                let cancel_read_elem_index =
-                    import(self, "cancel-read", vec![ValType::I32], vec![ValType::I32]);
-                let cancel_write_elem_index =
-                    import(self, "cancel-write", vec![ValType::I32], vec![ValType::I32]);
-                let drop_readable_elem_index =
-                    import(self, "drop-readable", vec![ValType::I32], vec![]);
-                let drop_writable_elem_index =
-                    import(self, "drop-writable", vec![ValType::I32], vec![]);
 
                 let lift_elem_index = t.map(|t| {
                     let ty = self.define_ty([ValType::I32; 2], []);
@@ -1265,72 +1361,6 @@ fn dealias(resolve: &Resolve, mut id: TypeId) -> TypeId {
         match resolve.types[id].kind {
             TypeDefKind::Type(Type::Id(other)) => id = other,
             _ => break id,
-        }
-    }
-}
-
-fn collect_payload_data_for_func(
-    resolve: &Resolve,
-    interface: Option<&WorldKey>,
-    func: &wit_parser::Function,
-    prefix: &str,
-    data: &mut HashMap<TypeId, PayloadData>,
-) {
-    for (ordinal, ty) in func
-        .find_futures_and_streams(resolve)
-        .into_iter()
-        .enumerate()
-    {
-        match &resolve.types[ty].kind {
-            TypeDefKind::Future(_) | TypeDefKind::Stream(_) => {
-                data.entry(ty).or_insert_with(|| PayloadData {
-                    module: format!(
-                        "{prefix}{}",
-                        interface
-                            .map(|name| resolve.name_world_key(name))
-                            .unwrap_or_else(|| "$root".into())
-                    ),
-                    function: func.name.clone(),
-                    ordinal,
-                });
-            }
-            _ => unreachable!(),
-        }
-    }
-}
-
-fn collect_payload_data(
-    resolve: &Resolve,
-    world_id: WorldId,
-    data: &mut HashMap<TypeId, PayloadData>,
-) {
-    let world = &resolve.worlds[world_id];
-
-    for (key, import) in world.imports.iter() {
-        match import {
-            WorldItem::Interface { id, .. } => {
-                for (_, func) in resolve.interfaces[*id].functions.iter() {
-                    collect_payload_data_for_func(resolve, Some(key), func, "", data);
-                }
-            }
-            WorldItem::Type(_) => {}
-            WorldItem::Function(func) => {
-                collect_payload_data_for_func(resolve, None, func, "", data);
-            }
-        }
-    }
-
-    for (key, export) in world.exports.iter() {
-        match export {
-            WorldItem::Interface { id, .. } => {
-                for (_, func) in resolve.interfaces[*id].functions.iter() {
-                    collect_payload_data_for_func(resolve, Some(key), func, "[export]", data);
-                }
-            }
-            WorldItem::Type(_) => unreachable!(),
-            WorldItem::Function(func) => {
-                collect_payload_data_for_func(resolve, None, func, "[export]", data);
-            }
         }
     }
 }
