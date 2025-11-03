@@ -216,10 +216,10 @@ pub struct wit_future {
 pub type wit_future_t = wit_future;
 pub type wit_stream_new_fn_t = ::std::option::Option<unsafe extern "C" fn() -> u64>;
 pub type wit_stream_read_fn_t = ::std::option::Option<
-    unsafe extern "C" fn(future: u32, buffer: *mut ::std::os::raw::c_void, count: usize) -> u32,
+    unsafe extern "C" fn(stream: u32, buffer: *mut ::std::os::raw::c_void, count: usize) -> u32,
 >;
 pub type wit_stream_write_fn_t = ::std::option::Option<
-    unsafe extern "C" fn(buffer: *mut ::std::os::raw::c_void, count: usize) -> u32,
+    unsafe extern "C" fn(stream: u32, buffer: *mut ::std::os::raw::c_void, count: usize) -> u32,
 >;
 pub type wit_stream_cancel_read_fn_t =
     ::std::option::Option<unsafe extern "C" fn(stream: u32) -> u32>;

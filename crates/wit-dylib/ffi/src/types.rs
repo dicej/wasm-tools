@@ -1,6 +1,6 @@
 use crate::Call;
 use crate::ffi;
-use std::ffi::{CStr, c_char};
+use std::ffi::{CStr, c_char, c_void};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
@@ -1099,6 +1099,34 @@ impl Stream {
 
     pub fn ty(&self) -> Option<Type> {
         Type::from_raw_opt(self.wit, self.ptr.ty)
+    }
+
+    pub fn new(&self) -> unsafe extern "C" fn() -> u64 {
+        self.ptr.new.unwrap()
+    }
+
+    pub fn read(&self) -> unsafe extern "C" fn(u32, *mut c_void, usize) -> u32 {
+        self.ptr.read.unwrap()
+    }
+
+    pub fn write(&self) -> unsafe extern "C" fn(u32, *mut c_void, usize) -> u32 {
+        self.ptr.write.unwrap()
+    }
+
+    pub fn drop_readable(&self) -> unsafe extern "C" fn(u32) {
+        self.ptr.drop_readable.unwrap()
+    }
+
+    pub fn drop_writable(&self) -> unsafe extern "C" fn(u32) {
+        self.ptr.drop_writable.unwrap()
+    }
+
+    pub fn abi_payload_size(&self) -> usize {
+        self.ptr.abi_payload_size
+    }
+
+    pub fn abi_payload_align(&self) -> usize {
+        self.ptr.abi_payload_align
     }
 }
 

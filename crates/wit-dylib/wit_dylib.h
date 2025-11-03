@@ -235,8 +235,8 @@ typedef struct wit_future {
 } wit_future_t;
 
 typedef uint64_t(*wit_stream_new_fn_t)();
-typedef uint32_t(*wit_stream_read_fn_t)(uint32_t future, void *buffer, size_t count);
-typedef uint32_t(*wit_stream_write_fn_t)(void *buffer, size_t count);
+typedef uint32_t(*wit_stream_read_fn_t)(uint32_t stream, void *buffer, size_t count);
+typedef uint32_t(*wit_stream_write_fn_t)(uint32_t stream, void *buffer, size_t count);
 typedef uint32_t(*wit_stream_cancel_read_fn_t)(uint32_t stream);
 typedef uint32_t(*wit_stream_cancel_write_fn_t)(uint32_t stream);
 typedef void(*wit_stream_drop_writable_fn_t)(uint32_t stream);
