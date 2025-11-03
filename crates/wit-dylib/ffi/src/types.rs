@@ -1064,6 +1064,50 @@ impl Future {
     pub fn ty(&self) -> Option<Type> {
         Type::from_raw_opt(self.wit, self.ptr.ty)
     }
+
+    pub fn new(&self) -> unsafe extern "C" fn() -> u64 {
+        self.ptr.new.unwrap()
+    }
+
+    pub fn read(&self) -> unsafe extern "C" fn(u32, *mut c_void) -> u32 {
+        self.ptr.read.unwrap()
+    }
+
+    pub fn write(&self) -> unsafe extern "C" fn(u32, *const c_void) -> u32 {
+        self.ptr.write.unwrap()
+    }
+
+    pub fn cancel_read(&self) -> unsafe extern "C" fn(u32) -> u32 {
+        self.ptr.cancel_read.unwrap()
+    }
+
+    pub fn cancel_write(&self) -> unsafe extern "C" fn(u32) -> u32 {
+        self.ptr.cancel_write.unwrap()
+    }
+
+    pub fn drop_readable(&self) -> unsafe extern "C" fn(u32) {
+        self.ptr.drop_readable.unwrap()
+    }
+
+    pub fn drop_writable(&self) -> unsafe extern "C" fn(u32) {
+        self.ptr.drop_writable.unwrap()
+    }
+
+    pub unsafe fn lift(&self, cx: &mut impl Call, buffer: *mut u8) {
+        unsafe { self.ptr.lift.unwrap()((&raw mut *cx).cast(), buffer.cast()) };
+    }
+
+    pub unsafe fn lower(&self, cx: &mut impl Call, buffer: *mut u8) {
+        unsafe { self.ptr.lower.unwrap()((&raw mut *cx).cast(), buffer.cast()) };
+    }
+
+    pub fn abi_payload_size(&self) -> usize {
+        self.ptr.abi_payload_size
+    }
+
+    pub fn abi_payload_align(&self) -> usize {
+        self.ptr.abi_payload_align
+    }
 }
 
 impl fmt::Debug for Future {
@@ -1109,8 +1153,16 @@ impl Stream {
         self.ptr.read.unwrap()
     }
 
-    pub fn write(&self) -> unsafe extern "C" fn(u32, *mut c_void, usize) -> u32 {
+    pub fn write(&self) -> unsafe extern "C" fn(u32, *const c_void, usize) -> u32 {
         self.ptr.write.unwrap()
+    }
+
+    pub fn cancel_read(&self) -> unsafe extern "C" fn(u32) -> u32 {
+        self.ptr.cancel_read.unwrap()
+    }
+
+    pub fn cancel_write(&self) -> unsafe extern "C" fn(u32) -> u32 {
+        self.ptr.cancel_write.unwrap()
     }
 
     pub fn drop_readable(&self) -> unsafe extern "C" fn(u32) {
@@ -1119,6 +1171,14 @@ impl Stream {
 
     pub fn drop_writable(&self) -> unsafe extern "C" fn(u32) {
         self.ptr.drop_writable.unwrap()
+    }
+
+    pub unsafe fn lift(&self, cx: &mut impl Call, buffer: *mut u8) {
+        unsafe { self.ptr.lift.unwrap()((&raw mut *cx).cast(), buffer.cast()) };
+    }
+
+    pub unsafe fn lower(&self, cx: &mut impl Call, buffer: *mut u8) {
+        unsafe { self.ptr.lower.unwrap()((&raw mut *cx).cast(), buffer.cast()) };
     }
 
     pub fn abi_payload_size(&self) -> usize {

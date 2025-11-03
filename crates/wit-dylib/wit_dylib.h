@@ -206,12 +206,12 @@ typedef struct wit_fixed_size_list {
      wit_type_t ty;
 } wit_fixed_size_list_t;
 
-typedef void(*wit_lift_fn_t)(void* cx, void *buffer);
+typedef void(*wit_lift_fn_t)(void* cx, const void *buffer);
 typedef void(*wit_lower_fn_t)(void* cx, void *buffer);
 
 typedef uint64_t(*wit_future_new_fn_t)();
 typedef uint32_t(*wit_future_read_fn_t)(uint32_t future, void *buffer);
-typedef uint32_t(*wit_future_write_fn_t)(uint32_t future, void *buffer);
+typedef uint32_t(*wit_future_write_fn_t)(uint32_t future, const void *buffer);
 typedef uint32_t(*wit_future_cancel_read_fn_t)(uint32_t future);
 typedef uint32_t(*wit_future_cancel_write_fn_t)(uint32_t future);
 typedef void(*wit_future_drop_readable_fn_t)(uint32_t future);
@@ -236,7 +236,7 @@ typedef struct wit_future {
 
 typedef uint64_t(*wit_stream_new_fn_t)();
 typedef uint32_t(*wit_stream_read_fn_t)(uint32_t stream, void *buffer, size_t count);
-typedef uint32_t(*wit_stream_write_fn_t)(uint32_t stream, void *buffer, size_t count);
+typedef uint32_t(*wit_stream_write_fn_t)(uint32_t stream, const void *buffer, size_t count);
 typedef uint32_t(*wit_stream_cancel_read_fn_t)(uint32_t stream);
 typedef uint32_t(*wit_stream_cancel_write_fn_t)(uint32_t stream);
 typedef void(*wit_stream_drop_writable_fn_t)(uint32_t stream);

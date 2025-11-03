@@ -177,7 +177,7 @@ pub struct wit_fixed_size_list {
 }
 pub type wit_fixed_size_list_t = wit_fixed_size_list;
 pub type wit_lift_fn_t = ::std::option::Option<
-    unsafe extern "C" fn(cx: *mut ::std::os::raw::c_void, buffer: *mut ::std::os::raw::c_void),
+    unsafe extern "C" fn(cx: *mut ::std::os::raw::c_void, buffer: *const ::std::os::raw::c_void),
 >;
 pub type wit_lower_fn_t = ::std::option::Option<
     unsafe extern "C" fn(cx: *mut ::std::os::raw::c_void, buffer: *mut ::std::os::raw::c_void),
@@ -187,7 +187,7 @@ pub type wit_future_read_fn_t = ::std::option::Option<
     unsafe extern "C" fn(future: u32, buffer: *mut ::std::os::raw::c_void) -> u32,
 >;
 pub type wit_future_write_fn_t = ::std::option::Option<
-    unsafe extern "C" fn(future: u32, buffer: *mut ::std::os::raw::c_void) -> u32,
+    unsafe extern "C" fn(future: u32, buffer: *const ::std::os::raw::c_void) -> u32,
 >;
 pub type wit_future_cancel_read_fn_t =
     ::std::option::Option<unsafe extern "C" fn(future: u32) -> u32>;
@@ -219,7 +219,7 @@ pub type wit_stream_read_fn_t = ::std::option::Option<
     unsafe extern "C" fn(stream: u32, buffer: *mut ::std::os::raw::c_void, count: usize) -> u32,
 >;
 pub type wit_stream_write_fn_t = ::std::option::Option<
-    unsafe extern "C" fn(stream: u32, buffer: *mut ::std::os::raw::c_void, count: usize) -> u32,
+    unsafe extern "C" fn(stream: u32, buffer: *const ::std::os::raw::c_void, count: usize) -> u32,
 >;
 pub type wit_stream_cancel_read_fn_t =
     ::std::option::Option<unsafe extern "C" fn(stream: u32) -> u32>;
