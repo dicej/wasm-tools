@@ -925,7 +925,7 @@ impl<'a> EncodingState<'a> {
             None,
         );
         let prev = self.exported_instances.insert(export, idx);
-        assert!(prev.is_none());
+        assert!(prev.is_none(), "duplicate export: {export_name}");
 
         // After everything is all said and done remove all the type information
         // about type exports of this interface. Any entries in the map
